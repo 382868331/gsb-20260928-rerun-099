@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -123,6 +125,182 @@ func TestContextCancelSendsCancelAndStopsCall(t *testing.T) {
 	}
 }
 
+func TestStreamOrderAndConcurrentCallsShareConnection(t *testing.T) {
+	server := newTestServer(t, nil)
+	HandleStream[testPayload, testReply](server, "stream", func(_ context.Context, req *testPayload, out *TypedServerStream[testReply]) error {
+		for i := 0; i < 3; i++ {
+			if _, err := out.Send(context.Background(), testReply{Value: fmt.Sprintf("%s-%d", req.Value, i)}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	server.Handle("test", func(_ context.Context, payload []byte, _ map[string]string) ([]byte, map[string]string, error) {
+		var req testPayload
+		if err := (JSONCodec{}).Decode(payload, &req); err != nil {
+			return nil, nil, err
+		}
+		return []byte(fmt.Sprintf(`{"value":%q}`, "unary:"+req.Value)), nil, nil
+	})
+	client := dialTestClient(t, server, ClientConfig{})
+	stream, err := CallStream[testPayload, testReply](context.Background(), client, "stream", testPayload{Value: "item"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := stream.Recv(context.Background())
+	if err != nil || first.Value != "item-0" {
+		t.Fatalf("first = %+v, %v", first, err)
+	}
+	got := []string{first.Value}
+	for {
+		item, _, err := stream.Recv(context.Background())
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, item.Value)
+	}
+	want := []string{"item-0", "item-1", "item-2"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("items = %v, want %v", got, want)
+	}
+	errCh := make(chan error, 2)
+	for _, value := range []string{"one", "two"} {
+		go func(value string) {
+			_, _, err := Call[testPayload, testReply](context.Background(), client, "test", testPayload{Value: value}, nil)
+			errCh <- err
+		}(value)
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestStreamSlowReaderAppliesBackpressure(t *testing.T) {
+	server := newTestServer(t, nil)
+	firstSent := make(chan struct{})
+	largeSent := make(chan error, 1)
+	HandleStream[testPayload, testReply](server, "stream", func(ctx context.Context, _ *testPayload, out *TypedServerStream[testReply]) error {
+		if _, err := out.Send(ctx, testReply{Value: "ready"}); err != nil {
+			return err
+		}
+		close(firstSent)
+		_, err := out.Send(ctx, testReply{Value: "large"})
+		largeSent <- err
+		return err
+	})
+	client := dialTestClient(t, server, ClientConfig{})
+	stream, err := CallStream[testPayload, testReply](context.Background(), client, "stream", testPayload{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, _, err := stream.Recv(context.Background())
+	if err != nil || ready.Value != "ready" {
+		t.Fatalf("ready = %+v, %v", ready, err)
+	}
+	<-firstSent
+	select {
+	case err := <-largeSent:
+		t.Fatalf("large send completed before reader consumed data: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	done := make(chan int, 1)
+	go func() {
+		item, _, err := stream.Recv(context.Background())
+		if err != nil {
+			done <- -1
+			return
+		}
+		done <- len(item.Value)
+	}()
+	select {
+	case n := <-done:
+		if n != len("large") {
+			t.Fatalf("large item size = %d", n)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader did not receive backpressured item")
+	}
+	select {
+	case err := <-largeSent:
+		if err != nil {
+			t.Fatalf("server send: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server send did not finish after consumption")
+	}
+}
+
+func TestStreamAckBypassesFullOrdinaryWriteQueue(t *testing.T) {
+	server := newTestServer(t, nil)
+	second := make(chan struct{})
+	HandleStream[testPayload, testReply](server, "stream", func(ctx context.Context, _ *testPayload, out *TypedServerStream[testReply]) error {
+		if _, err := out.Send(ctx, testReply{Value: "first"}); err != nil {
+			return err
+		}
+		<-second
+		if _, err := out.Send(ctx, testReply{Value: "second"}); err != nil {
+			return err
+		}
+		return nil
+	})
+	client := dialTestClient(t, server, ClientConfig{WriteQueue: 1})
+	stream, err := CallStream[testPayload, testReply](context.Background(), client, "stream", testPayload{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := stream.Recv(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(second)
+	for i := 0; i < 8; i++ {
+		go func() { _, _ = client.Call(context.Background(), "missing", testPayload{}, nil, nil) }()
+	}
+	item, _, err := stream.Recv(context.Background())
+	if err != nil {
+		t.Fatalf("second item after prioritized ack: %v", err)
+	}
+	if item.Value != "second" {
+		t.Fatalf("item = %q", item.Value)
+	}
+}
+
+func TestStreamCancelStopsBothSidesWithoutBufferedResults(t *testing.T) {
+	server := newTestServer(t, nil)
+	started := make(chan struct{})
+	serverStopped := make(chan struct{})
+	HandleStream[testPayload, testReply](server, "stream", func(ctx context.Context, _ *testPayload, out *TypedServerStream[testReply]) error {
+		defer close(serverStopped)
+		if _, err := out.Send(ctx, testReply{Value: "start"}); err != nil {
+			return err
+		}
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	client := dialTestClient(t, server, ClientConfig{})
+	stream, err := CallStream[testPayload, testReply](context.Background(), client, "stream", testPayload{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := stream.Recv(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-serverStopped:
+	case <-time.After(time.Second):
+		t.Fatal("server stream remained after cancel")
+	}
+}
+
 func TestTimeout(t *testing.T) {
 	handler := func(ctx context.Context, _ []byte, _ map[string]string) ([]byte, map[string]string, error) {
 		<-ctx.Done()
@@ -207,17 +385,19 @@ func TestLateResponseFromOldConnectionCannotMatchNewCall(t *testing.T) {
 
 	newDone := make(chan *Envelope, 1)
 	newSession.mu.Lock()
-	newSession.pending[oldID] = newDone
+	newSession.pending[oldID] = &pendingCall{id: oldID, ch: newDone, done: make(chan struct{})}
 	newSession.mu.Unlock()
 	oldDone := make(chan *Envelope, 1)
+	var oldCall *pendingCall
 	oldConn.mu.Lock()
-	oldConn.pending[oldID] = oldDone
+	oldCall = &pendingCall{id: oldID, ch: oldDone, done: make(chan struct{})}
+	oldConn.pending[oldID] = oldCall
 	oldConn.mu.Unlock()
 
 	env := &Envelope{Type: TypeResponse, ID: oldID, Payload: []byte(`{"value":"stale"}`), Serializer: serializerJSON}
-	oldConn.remove(oldID, env)
+	oldConn.remove(oldID)
 	select {
-	case <-oldDone:
+	case <-oldCall.done:
 	default:
 		t.Fatal("old session should not deliver after close")
 	}

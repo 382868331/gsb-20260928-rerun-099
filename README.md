@@ -7,8 +7,8 @@
 - `rpc/frame.go`：4 字节大端长度前缀分帧，并限制单帧大小。
 - `rpc/envelope.go`：消息信封，包含请求 ID、方法名、错误、头部和业务负载。
 - `rpc/codec.go`：负载编码接口；当前提供 JSON，后续可替换或组合压缩编码。
-- `rpc/client.go`：单连接复用、等待表、取消帧、断线失败和自动重连。
-- `rpc/server.go`：请求分发、连接隔离、并发上限、鉴权钩子、截止时间传播和 panic 隔离。
+- `rpc/client.go`：单连接复用、会话等待表、普通调用、连续结果读取、优先取消帧和断线失败。
+- `rpc/server.go`：普通/流式请求分发、连接隔离、逐片段 ACK 背压、并发上限、鉴权、截止时间和 panic 隔离。
 - `demo/` 与 `cmd/`：本机双进程演示和类型化业务定义。
 
 ## 关键语义
@@ -19,6 +19,9 @@
 - `context.WithTimeout` 本地立即结束调用，并通过截止时间头部让服务端提前停止工作。
 - 连接断开时，该连接上的等待调用统一返回 `ErrConnectionClosed`；后续调用自动建立新会话。
 - 旧会话关闭后其等待表被清空，旧连接的迟到响应不可能匹配新调用。
+- 流式请求使用独立信封 ID；客户端按 `Recv` 返回顺序投递，服务端在收到上一片段 ACK 前不会发送下一片段，因此慢读取方看到的未消费在途片段最多为 1。
+- 主动取消使用独立高优先级取消帧，不排在被流控的普通写消息之后；连接断开会取消该连接上的服务端 context，客户端等待同时结束。
+- 流式正常结束返回 `io.EOF`；取消返回 `context.Canceled`，连接错误返回 `ErrConnectionClosed`。
 - 坏帧或超大帧只关闭对应连接；非法大小、未知版本等在进入业务处理前被拒绝。
 - `MaxPending` 限制等待调用数量，`WriteQueue` 限制连接写队列，`MaxHandlers` 限制服务端并发 handler。
 - 鉴权通过请求头部注入，不进入业务请求结构；压缩后续可作为负载编码或内容编码层扩展。
@@ -31,13 +34,29 @@
 go run ./cmd/demo-server -addr 127.0.0.1:19090 -token local-demo-token
 ```
 
-另开终端运行客户端：
+另开终端运行普通流式、取消和背压演练：
 
 ```bash
-go run ./cmd/demo-client -addr 127.0.0.1:19090 -token local-demo-token
+go run ./cmd/demo-client -addr 127.0.0.1:19090 -token local-demo-token -phase stream
 ```
 
-客户端会复用同一条连接完成普通调用，并中途取消一个长任务。
+输出会核对普通调用结果、6 个片段的顺序、`max_inflight=1`、最终 `state=eof`，并确认取消的观察流最终为 `state=canceled`。
+
+一键脚本会启动真实 TCP 服务端，完成流式阶段后杀掉并重启服务端，再启动新客户端验证旧连接结束后的新会话往返：
+
+```bash
+./demo/run.sh
+```
+
+也可以手动模拟重连：
+
+```bash
+go run ./cmd/demo-server -addr 127.0.0.1:19091
+go run ./cmd/demo-client -addr 127.0.0.1:19091 -phase stream
+# 停止服务端后重新启动
+go run ./cmd/demo-server -addr 127.0.0.1:19091
+go run ./cmd/demo-client -addr 127.0.0.1:19091 -phase reconnect
+```
 
 ## 测试
 
@@ -45,4 +64,4 @@ go run ./cmd/demo-client -addr 127.0.0.1:19090 -token local-demo-token
 go test -race ./...
 ```
 
-测试覆盖并发乱序响应、真实上下文取消、超时、断连结束调用、重连、旧会话响应隔离、坏帧隔离、消息大小限制和等待队列限制。
+测试覆盖并发乱序响应、流式顺序、共享连接关联、慢读取 ACK 背压、真实上下文取消、超时、断连结束调用、重连、旧会话响应隔离、坏帧隔离、消息大小限制和等待队列限制。

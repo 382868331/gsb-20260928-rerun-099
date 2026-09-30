@@ -1,8 +1,10 @@
 package rpc
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -30,9 +32,12 @@ type CallResult struct {
 }
 
 type clientSession struct {
+	cfg       ClientConfig
 	conn      net.Conn
+	reader    *bufio.Reader
 	writeCh   chan []byte
-	pending   map[uint64]chan *Envelope
+	cancelCh  chan []byte
+	pending   map[uint64]*pendingCall
 	nextID    atomic.Uint64
 	mu        sync.Mutex
 	closed    chan struct{}
@@ -40,9 +45,20 @@ type clientSession struct {
 }
 
 type pendingCall struct {
-	done   chan *Envelope
-	method string
+	id        uint64
+	method    string
+	ch        chan *Envelope
+	done      chan struct{}
+	stream    bool
+	closeOnce sync.Once
 }
+
+type Stream struct {
+	session *clientSession
+	call    *pendingCall
+}
+
+func (s *clientSession) cfgRef() ClientConfig { return s.cfg }
 
 func newClientWithConn(conn net.Conn, cfg ClientConfig) *Client {
 	cfg = withDefaults(cfg)
@@ -129,6 +145,72 @@ func (c *Client) Call(ctx context.Context, method string, arg any, reply any, he
 	return result.Headers, nil
 }
 
+func (c *Client) Stream(ctx context.Context, method string, arg any, headers map[string]string) (*Stream, error) {
+	payload, err := c.cfg.Codec.Encode(arg)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > c.cfg.MaxFrameSize {
+		return nil, ErrMessageTooLarge
+	}
+	merged := mergeHeaders(c.cfg.Headers, headers)
+	env := &Envelope{Type: TypeRequest, Flags: FlagStream, Method: method, Payload: payload, Headers: merged, Serializer: c.cfg.Codec.ID()}
+	if deadline, ok := ctx.Deadline(); ok {
+		if env.Headers == nil {
+			env.Headers = map[string]string{}
+		}
+		env.Headers["x-lrpc-deadline-unix-nano"] = formatDeadline(deadline)
+	}
+	s, err := c.sessionForCall(ctx)
+	if err != nil {
+		return nil, err
+	}
+	call, err := s.begin(ctx, env, c.cfg, true)
+	if err != nil {
+		return nil, err
+	}
+	return &Stream{session: s, call: call}, nil
+}
+
+func (s *Stream) Recv(ctx context.Context) ([]byte, map[string]string, error) {
+	select {
+	case <-ctx.Done():
+		s.session.cancel(s.call.id, s.call.method, s.session.cfgRef())
+		s.session.remove(s.call.id)
+		return nil, nil, ctx.Err()
+	case <-s.session.closed:
+		return nil, nil, ErrConnectionClosed
+	case <-s.call.done:
+		return nil, nil, ErrConnectionClosed
+	case env := <-s.call.ch:
+		if env == nil {
+			return nil, nil, ErrConnectionClosed
+		}
+		switch env.Type {
+		case TypeStream:
+			if env.Flags&FlagStream != 0 {
+				s.session.remove(s.call.id)
+				return env.Payload, env.Headers, io.EOF
+			}
+			s.session.ack(s.call.id, s.call.method, s.session.cfg)
+			return env.Payload, env.Headers, nil
+		case TypeResponse:
+			s.session.remove(s.call.id)
+			return env.Payload, env.Headers, io.EOF
+		case TypeError:
+			s.session.remove(s.call.id)
+			return nil, env.Headers, &CallError{Message: env.Error}
+		}
+	}
+	return nil, nil, ErrBadFrame
+}
+
+func (s *Stream) Close() error {
+	s.session.cancel(s.call.id, s.call.method, s.session.cfgRef())
+	s.session.remove(s.call.id)
+	return nil
+}
+
 func (c *Client) sessionForCall(ctx context.Context) (*clientSession, error) {
 	c.mu.Lock()
 	if c.closed {
@@ -177,10 +259,13 @@ func (c *Client) connectLocked(ctx context.Context) (*clientSession, error) {
 
 func (c *Client) newSession(conn net.Conn) *clientSession {
 	s := &clientSession{
-		conn:    conn,
-		writeCh: make(chan []byte, c.cfg.WriteQueue),
-		pending: make(map[uint64]chan *Envelope),
-		closed:  make(chan struct{}),
+		cfg:      c.cfg,
+		conn:     conn,
+		reader:   bufio.NewReader(conn),
+		writeCh:  make(chan []byte, c.cfg.WriteQueue),
+		cancelCh: make(chan []byte, 8),
+		pending:  make(map[uint64]*pendingCall),
+		closed:   make(chan struct{}),
 	}
 	s.nextID.Store(fastrandID())
 	go s.writeLoop(c.cfg.MaxFrameSize)
@@ -189,6 +274,29 @@ func (c *Client) newSession(conn net.Conn) *clientSession {
 }
 
 func (s *clientSession) send(ctx context.Context, env *Envelope, cfg ClientConfig) (*Envelope, error) {
+	call, err := s.begin(ctx, env, cfg, false)
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		s.cancel(call.id, env.Method, cfg)
+		s.remove(call.id)
+		return nil, ctx.Err()
+	case <-call.done:
+		return nil, ErrConnectionClosed
+	case response := <-call.ch:
+		if response == nil {
+			return nil, ErrConnectionClosed
+		}
+		if response.Type == TypeError {
+			return nil, &CallError{Message: response.Error}
+		}
+		return response, nil
+	}
+}
+
+func (s *clientSession) begin(ctx context.Context, env *Envelope, cfg ClientConfig, stream bool) (*pendingCall, error) {
 	s.mu.Lock()
 	select {
 	case <-s.closed:
@@ -202,34 +310,24 @@ func (s *clientSession) send(ctx context.Context, env *Envelope, cfg ClientConfi
 	}
 	id := s.nextID.Add(1)
 	env.ID = id
-	done := make(chan *Envelope, 1)
-	s.pending[id] = done
+	chSize := 1
+	if stream {
+		chSize = 0
+	}
+	call := &pendingCall{id: id, method: env.Method, ch: make(chan *Envelope, chSize), done: make(chan struct{}), stream: stream}
+	s.pending[id] = call
 	s.mu.Unlock()
 
 	frame, err := EncodeEnvelope(env, cfg.MaxFrameSize)
 	if err != nil {
-		s.remove(id, nil)
+		s.remove(id)
 		return nil, err
 	}
 	if err := s.enqueue(frame); err != nil {
-		s.remove(id, nil)
+		s.remove(id)
 		return nil, err
 	}
-
-	select {
-	case <-ctx.Done():
-		s.cancel(id, env.Method, cfg)
-		s.remove(id, nil)
-		return nil, ctx.Err()
-	case env := <-done:
-		if env == nil {
-			return nil, ErrConnectionClosed
-		}
-		if env.Type == TypeError {
-			return nil, &CallError{Message: env.Error}
-		}
-		return env, nil
-	}
+	return call, nil
 }
 
 func (s *clientSession) enqueue(frame []byte) error {
@@ -249,29 +347,36 @@ func (s *clientSession) enqueue(frame []byte) error {
 func (s *clientSession) cancel(id uint64, method string, cfg ClientConfig) {
 	frame, err := EncodeEnvelope(&Envelope{Type: TypeCancel, ID: id, Method: method, Serializer: cfg.Codec.ID()}, cfg.MaxFrameSize)
 	if err == nil {
-		_ = s.enqueue(frame)
+		select {
+		case s.cancelCh <- frame:
+		default:
+		}
 	}
 }
 
-func (s *clientSession) remove(id uint64, env *Envelope) {
-	s.mu.Lock()
-	if ch, ok := s.pending[id]; ok {
-		delete(s.pending, id)
-		if env != nil {
-			select {
-			case ch <- env:
-			default:
-			}
+func (s *clientSession) ack(id uint64, method string, cfg ClientConfig) {
+	frame, err := EncodeEnvelope(&Envelope{Type: TypeAck, ID: id, Method: method, Serializer: cfg.Codec.ID()}, cfg.MaxFrameSize)
+	if err == nil {
+		select {
+		case s.cancelCh <- frame:
+		default:
 		}
+	}
+}
+
+func (s *clientSession) remove(id uint64) {
+	s.mu.Lock()
+	if call, ok := s.pending[id]; ok {
+		delete(s.pending, id)
+		call.closeOnce.Do(func() { close(call.done) })
 	}
 	s.mu.Unlock()
 }
 
 func (s *clientSession) readLoop(maxSize int) {
 	defer s.close(ErrConnectionClosed)
-	var buf []byte
 	for {
-		frame, err := ReadFrame(s.conn, maxSize, buf)
+		frame, err := ReadFrame(s.reader, maxSize, nil)
 		if err != nil {
 			return
 		}
@@ -282,18 +387,42 @@ func (s *clientSession) readLoop(maxSize int) {
 			}
 			return
 		}
-		if env.Type != TypeResponse && env.Type != TypeError {
+		if env.Type != TypeResponse && env.Type != TypeError && env.Type != TypeStream {
 			continue
 		}
-		s.remove(env.ID, env)
+		s.mu.Lock()
+		call := s.pending[env.ID]
+		s.mu.Unlock()
+		if call == nil {
+			continue
+		}
+		select {
+		case call.ch <- env:
+		case <-call.done:
+		case <-s.closed:
+			return
+		}
 	}
 }
 
 func (s *clientSession) writeLoop(maxSize int) {
 	defer s.close(ErrConnectionClosed)
 	for {
+		writeCh := s.writeCh
 		select {
-		case frame := <-s.writeCh:
+		case frame := <-s.cancelCh:
+			if err := WriteFrame(s.conn, maxSize, frame); err != nil {
+				return
+			}
+			continue
+		default:
+		}
+		select {
+		case frame := <-s.cancelCh:
+			if err := WriteFrame(s.conn, maxSize, frame); err != nil {
+				return
+			}
+		case frame := <-writeCh:
 			if err := WriteFrame(s.conn, maxSize, frame); err != nil {
 				return
 			}
@@ -308,12 +437,9 @@ func (s *clientSession) close(err error) {
 		close(s.closed)
 		_ = s.conn.Close()
 		s.mu.Lock()
-		for id, ch := range s.pending {
+		for id, call := range s.pending {
 			delete(s.pending, id)
-			select {
-			case ch <- nil:
-			default:
-			}
+			call.closeOnce.Do(func() { close(call.done) })
 		}
 		s.mu.Unlock()
 	})

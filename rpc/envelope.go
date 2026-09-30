@@ -13,6 +13,9 @@ const (
 	TypeResponse byte = 2
 	TypeError    byte = 3
 	TypeCancel   byte = 4
+	TypeStream   byte = 5
+	TypeAck      byte = 6
+	FlagStream   byte = 1
 )
 
 type Envelope struct {
@@ -23,6 +26,7 @@ type Envelope struct {
 	Headers    map[string]string
 	Payload    []byte
 	Serializer byte
+	Flags      byte
 }
 
 func EncodeEnvelope(e *Envelope, maxSize int) ([]byte, error) {
@@ -42,7 +46,7 @@ func EncodeEnvelope(e *Envelope, maxSize int) ([]byte, error) {
 		serializer = serializerJSON
 	}
 	b = append(b, serializer)
-	b = append(b, 0)
+	b = append(b, e.Flags)
 	b = binary.BigEndian.AppendUint64(b, e.ID)
 	b = appendString(b, e.Method)
 	b = appendString(b, e.Error)
@@ -69,9 +73,10 @@ func DecodeEnvelope(frame []byte) (*Envelope, error) {
 	pos++
 	e.Serializer = frame[pos]
 	pos++
+	e.Flags = frame[pos]
 	pos++
 	switch e.Type {
-	case TypeRequest, TypeResponse, TypeError, TypeCancel:
+	case TypeRequest, TypeResponse, TypeError, TypeCancel, TypeStream, TypeAck:
 	default:
 		return nil, fmt.Errorf("%w: unknown frame type", ErrBadFrame)
 	}

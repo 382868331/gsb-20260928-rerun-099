@@ -1,16 +1,19 @@
 package rpc
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 )
 
 type RawHandler func(ctx context.Context, payload []byte, headers map[string]string) ([]byte, map[string]string, error)
+type RawStreamHandler func(ctx context.Context, payload []byte, headers map[string]string, stream *ServerStream) error
 
 type Authenticator func(headers map[string]string) error
 
@@ -25,15 +28,16 @@ type ServerConfig struct {
 }
 
 type Server struct {
-	cfg      ServerConfig
-	mu       sync.RWMutex
-	handlers map[string]RawHandler
-	listener net.Listener
-	closed   chan struct{}
-	closeMu  sync.Mutex
-	conns    sync.WaitGroup
-	activeMu sync.Mutex
-	active   map[net.Conn]struct{}
+	cfg            ServerConfig
+	mu             sync.RWMutex
+	handlers       map[string]RawHandler
+	streamHandlers map[string]RawStreamHandler
+	listener       net.Listener
+	closed         chan struct{}
+	closeMu        sync.Mutex
+	conns          sync.WaitGroup
+	activeMu       sync.Mutex
+	active         map[net.Conn]struct{}
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -52,13 +56,39 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.HeaderTimeout <= 0 {
 		cfg.HeaderTimeout = time.Minute
 	}
-	return &Server{cfg: cfg, handlers: make(map[string]RawHandler), closed: make(chan struct{}), active: make(map[net.Conn]struct{})}
+	return &Server{cfg: cfg, handlers: make(map[string]RawHandler), streamHandlers: make(map[string]RawStreamHandler), closed: make(chan struct{}), active: make(map[net.Conn]struct{})}
 }
 
 func (s *Server) Handle(method string, handler RawHandler) {
 	s.mu.Lock()
 	s.handlers[method] = handler
 	s.mu.Unlock()
+}
+
+func (s *Server) HandleStream(method string, handler RawStreamHandler) {
+	s.mu.Lock()
+	s.streamHandlers[method] = handler
+	s.mu.Unlock()
+}
+
+type serverWriteReq struct {
+	env   *Envelope
+	errCh chan error
+}
+
+type ServerStream struct {
+	id         uint64
+	send       func(context.Context, *Envelope) error
+	serializer byte
+	waitAck    func(context.Context) error
+}
+
+func (s *ServerStream) Send(ctx context.Context, payload []byte, headers map[string]string) (map[string]string, error) {
+	err := s.send(ctx, &Envelope{Type: TypeStream, ID: s.id, Payload: payload, Headers: headers, Serializer: s.serializer})
+	if err == nil && s.waitAck != nil {
+		err = s.waitAck(ctx)
+	}
+	return headers, err
 }
 
 func HandleTyped[Arg any, Reply any](s *Server, method string, fn TypedHandler[Arg, Reply]) {
@@ -156,8 +186,9 @@ func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 
 	connDone := make(chan struct{})
-	writeCh := make(chan *Envelope, s.cfg.WriteQueue)
+	writeCh := make(chan serverWriteReq)
 	requests := make(map[uint64]context.CancelFunc)
+	streamAcks := make(map[uint64]chan *Envelope)
 	var requestsMu sync.Mutex
 	semaphore := make(chan struct{}, s.cfg.MaxHandlers)
 	var active sync.WaitGroup
@@ -168,29 +199,46 @@ func (s *Server) serveConn(conn net.Conn) {
 		defer writeWG.Done()
 		for {
 			select {
-			case env := <-writeCh:
+			case req := <-writeCh:
+				env := req.env
 				frame, err := EncodeEnvelope(env, s.cfg.MaxFrameSize)
 				if err != nil {
+					req.errCh <- err
 					return
 				}
-				if err := WriteFrame(conn, s.cfg.MaxFrameSize, frame); err != nil {
+				_ = conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+				err = WriteFrame(conn, s.cfg.MaxFrameSize, frame)
+				_ = conn.SetWriteDeadline(time.Time{})
+				if err != nil {
+					req.errCh <- err
 					return
 				}
+				req.errCh <- nil
 			case <-connDone:
 				return
 			}
 		}
 	}()
 
-	var readBuf []byte
+	reader := bufio.NewReader(conn)
 	readErr := error(nil)
 	shutdownRead := false
 	for {
 		if shutdownRead {
 			break
 		}
-		frame, err := ReadFrame(conn, s.cfg.MaxFrameSize, readBuf)
+		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		frame, err := ReadFrame(reader, s.cfg.MaxFrameSize, nil)
+		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				select {
+				case <-s.closed:
+					return
+				default:
+					continue
+				}
+			}
 			readErr = err
 			break
 		}
@@ -200,6 +248,16 @@ func (s *Server) serveConn(conn net.Conn) {
 			break
 		}
 		switch env.Type {
+		case TypeAck:
+			requestsMu.Lock()
+			ack := streamAcks[env.ID]
+			requestsMu.Unlock()
+			if ack != nil {
+				select {
+				case ack <- env:
+				default:
+				}
+			}
 		case TypeCancel:
 			requestsMu.Lock()
 			cancel := requests[env.ID]
@@ -210,14 +268,14 @@ func (s *Server) serveConn(conn net.Conn) {
 		case TypeRequest:
 			if s.cfg.Authenticate != nil {
 				if err := s.cfg.Authenticate(env.Headers); err != nil {
-					s.sendError(writeCh, env, err)
+					s.sendError(writeCh, connDone, env, err)
 					continue
 				}
 			}
 			select {
 			case semaphore <- struct{}{}:
 			default:
-				s.sendError(writeCh, env, ErrBusy)
+				s.sendError(writeCh, connDone, env, ErrBusy)
 				continue
 			}
 			ctx, cancel := context.WithCancel(context.Background())
@@ -232,7 +290,13 @@ func (s *Server) serveConn(conn net.Conn) {
 			}
 			requestsMu.Lock()
 			requests[env.ID] = cancel
+			var ackCh chan *Envelope
+			if env.Flags&FlagStream != 0 {
+				ackCh = make(chan *Envelope, 1)
+				streamAcks[env.ID] = ackCh
+			}
 			requestsMu.Unlock()
+			streamCall := env.Flags&FlagStream != 0
 			active.Add(1)
 			go func(env *Envelope) {
 				defer active.Done()
@@ -241,20 +305,67 @@ func (s *Server) serveConn(conn net.Conn) {
 					cancel()
 					requestsMu.Lock()
 					delete(requests, env.ID)
+					delete(streamAcks, env.ID)
 					requestsMu.Unlock()
 				}()
+				writeEnv := func(outCtx context.Context, out *Envelope) error {
+					req := serverWriteReq{env: out, errCh: make(chan error, 1)}
+					select {
+					case writeCh <- req:
+						select {
+						case err := <-req.errCh:
+							return err
+						case <-outCtx.Done():
+							return outCtx.Err()
+						case <-connDone:
+							return ErrConnectionClosed
+						}
+					case <-outCtx.Done():
+						return outCtx.Err()
+					case <-connDone:
+						return ErrConnectionClosed
+					}
+				}
+				if streamCall {
+					stream := &ServerStream{
+						id:         env.ID,
+						serializer: s.cfg.Codec.ID(),
+						send:       writeEnv,
+						waitAck: func(waitCtx context.Context) error {
+							select {
+							case <-ackCh:
+								return nil
+							case <-waitCtx.Done():
+								return waitCtx.Err()
+							case <-connDone:
+								return ErrConnectionClosed
+							}
+						},
+					}
+					callErr := s.dispatchStreamSafe(ctx, env, stream)
+					if ctx.Err() != nil {
+						return
+					}
+					out := &Envelope{ID: env.ID, Serializer: s.cfg.Codec.ID(), Headers: map[string]string{}}
+					if callErr != nil {
+						out.Type = TypeError
+						out.Error = callErr.Error()
+					} else {
+						out.Type = TypeStream
+						out.Flags = FlagStream
+					}
+					_ = writeEnv(context.Background(), out)
+					return
+				}
 				payload, headers, callErr := s.dispatchSafe(ctx, env)
 				if ctx.Err() != nil {
 					return
 				}
 				if callErr != nil {
-					s.sendError(writeCh, env, callErr)
+					_ = writeEnv(context.Background(), &Envelope{Type: TypeError, ID: env.ID, Error: callErr.Error(), Serializer: s.cfg.Codec.ID()})
 					return
 				}
-				select {
-				case writeCh <- &Envelope{Type: TypeResponse, ID: env.ID, Payload: payload, Headers: headers, Serializer: s.cfg.Codec.ID()}:
-				case <-connDone:
-				}
+				_ = writeEnv(context.Background(), &Envelope{Type: TypeResponse, ID: env.ID, Payload: payload, Headers: headers, Serializer: s.cfg.Codec.ID()})
 			}(env)
 		default:
 			readErr = ErrBadFrame
@@ -262,8 +373,8 @@ func (s *Server) serveConn(conn net.Conn) {
 		}
 	}
 
-	close(connDone)
 	conn.Close()
+	close(connDone)
 	requestsMu.Lock()
 	for _, cancel := range requests {
 		cancel()
@@ -295,9 +406,31 @@ func (s *Server) dispatch(ctx context.Context, env *Envelope) ([]byte, map[strin
 	return handler(ctx, env.Payload, env.Headers)
 }
 
-func (s *Server) sendError(writeCh chan<- *Envelope, request *Envelope, err error) {
-	select {
-	case writeCh <- &Envelope{Type: TypeError, ID: request.ID, Error: err.Error(), Serializer: s.cfg.Codec.ID()}:
-	default:
+func (s *Server) dispatchStreamSafe(ctx context.Context, env *Envelope, stream *ServerStream) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = &CallError{Message: fmt.Sprintf("lrpc: stream handler panic: %v", recovered)}
+		}
+	}()
+	s.mu.RLock()
+	handler := s.streamHandlers[env.Method]
+	s.mu.RUnlock()
+	if handler == nil {
+		return &CallError{Message: "lrpc: unknown stream method: " + env.Method}
 	}
+	return handler(ctx, env.Payload, env.Headers, stream)
+}
+
+func (s *Server) sendError(writeCh chan<- serverWriteReq, connDone <-chan struct{}, request *Envelope, err error) {
+	go func() {
+		req := serverWriteReq{env: &Envelope{Type: TypeError, ID: request.ID, Error: err.Error(), Serializer: s.cfg.Codec.ID()}, errCh: make(chan error, 1)}
+		select {
+		case writeCh <- req:
+			select {
+			case <-req.errCh:
+			case <-connDone:
+			}
+		case <-connDone:
+		}
+	}()
 }

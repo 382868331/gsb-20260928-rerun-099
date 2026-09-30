@@ -22,6 +22,9 @@ func main() {
 	rpc.HandleTyped(server, "demo.Add", demo.Add)
 	rpc.HandleTyped(server, "demo.Delay", demo.Delay)
 	rpc.HandleTyped(server, "demo.Job", demo.Job)
+	rpc.HandleTyped(server, "demo.Status", demo.Status)
+	rpc.HandleStream(server, "demo.Numbers", demo.Numbers)
+	rpc.HandleStream(server, "demo.Watch", demo.Watch)
 
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
