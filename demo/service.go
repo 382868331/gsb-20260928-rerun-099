@@ -35,6 +35,18 @@ type JobResponse struct {
 
 var CanceledJobs atomic.Int64
 
+// CountRequest asks the server to emit Count consecutive numbered fragments.
+type CountRequest struct {
+	Count int `json:"count"`
+	Size  int `json:"size"`
+}
+
+// CountItem is one consecutive fragment of a Count stream.
+type CountItem struct {
+	Seq int    `json:"seq"`
+	Tag string `json:"tag"`
+}
+
 func Add(ctx context.Context, req *AddRequest) (AddResponse, error) {
 	return AddResponse{Sum: req.A + req.B}, nil
 }

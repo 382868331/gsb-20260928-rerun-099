@@ -13,6 +13,21 @@ const (
 	TypeResponse byte = 2
 	TypeError    byte = 3
 	TypeCancel   byte = 4
+	TypeStream   byte = 5
+)
+
+// Stream control headers carried on TypeStream frames.
+const (
+	// HeaderStream marks a TypeRequest as opening a server streaming call.
+	HeaderStream = "x-lrpc-stream"
+	// HeaderStreamAck grants the sender additional payload bytes (flow control).
+	HeaderStreamAck = "x-lrpc-stream-ack"
+	// HeaderStreamEnd marks the final frame of a stream (clean completion).
+	HeaderStreamEnd = "x-lrpc-stream-end"
+	// HeaderStreamError terminates the stream with a textual error.
+	HeaderStreamError = "x-lrpc-stream-error"
+	// HeaderStreamMore marks a non-final chunk of one logical fragment.
+	HeaderStreamMore = "x-lrpc-stream-more"
 )
 
 type Envelope struct {
@@ -71,7 +86,7 @@ func DecodeEnvelope(frame []byte) (*Envelope, error) {
 	pos++
 	pos++
 	switch e.Type {
-	case TypeRequest, TypeResponse, TypeError, TypeCancel:
+	case TypeRequest, TypeResponse, TypeError, TypeCancel, TypeStream:
 	default:
 		return nil, fmt.Errorf("%w: unknown frame type", ErrBadFrame)
 	}

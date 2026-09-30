@@ -19,21 +19,23 @@ type ServerConfig struct {
 	MaxFrameSize  int
 	WriteQueue    int
 	MaxHandlers   int
+	StreamWindow  int
 	Codec         PayloadCodec
 	Authenticate  Authenticator
 	HeaderTimeout time.Duration
 }
 
 type Server struct {
-	cfg      ServerConfig
-	mu       sync.RWMutex
-	handlers map[string]RawHandler
-	listener net.Listener
-	closed   chan struct{}
-	closeMu  sync.Mutex
-	conns    sync.WaitGroup
-	activeMu sync.Mutex
-	active   map[net.Conn]struct{}
+	cfg            ServerConfig
+	mu             sync.RWMutex
+	handlers       map[string]RawHandler
+	streamHandlers map[string]StreamHandler
+	listener       net.Listener
+	closed         chan struct{}
+	closeMu        sync.Mutex
+	conns          sync.WaitGroup
+	activeMu       sync.Mutex
+	active         map[net.Conn]struct{}
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -46,18 +48,28 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.MaxHandlers <= 0 {
 		cfg.MaxHandlers = 1024
 	}
+	if cfg.StreamWindow <= 0 {
+		cfg.StreamWindow = defaultStreamWindow
+	}
 	if cfg.Codec == nil {
 		cfg.Codec = JSONCodec{}
 	}
 	if cfg.HeaderTimeout <= 0 {
 		cfg.HeaderTimeout = time.Minute
 	}
-	return &Server{cfg: cfg, handlers: make(map[string]RawHandler), closed: make(chan struct{}), active: make(map[net.Conn]struct{})}
+	return &Server{cfg: cfg, handlers: make(map[string]RawHandler), streamHandlers: make(map[string]StreamHandler), closed: make(chan struct{}), active: make(map[net.Conn]struct{})}
 }
 
 func (s *Server) Handle(method string, handler RawHandler) {
 	s.mu.Lock()
 	s.handlers[method] = handler
+	s.mu.Unlock()
+}
+
+// HandleStream registers a server-streaming method.
+func (s *Server) HandleStream(method string, handler StreamHandler) {
+	s.mu.Lock()
+	s.streamHandlers[method] = handler
 	s.mu.Unlock()
 }
 
@@ -156,31 +168,52 @@ func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 
 	connDone := make(chan struct{})
-	writeCh := make(chan *Envelope, s.cfg.WriteQueue)
 	requests := make(map[uint64]context.CancelFunc)
+	streams := make(map[uint64]*serverStream)
 	var requestsMu sync.Mutex
 	semaphore := make(chan struct{}, s.cfg.MaxHandlers)
 	var active sync.WaitGroup
+
+	// Unary responses use a priority lane: a flow-blocked streaming sender must
+	// never delay an ordinary response traveling on the same connection.
+	streamCh := make(chan *Envelope, s.cfg.WriteQueue)
+	unaryCh := make(chan *Envelope, s.cfg.WriteQueue)
 
 	var writeWG sync.WaitGroup
 	writeWG.Add(1)
 	go func() {
 		defer writeWG.Done()
 		for {
+			var env *Envelope
 			select {
-			case env := <-writeCh:
-				frame, err := EncodeEnvelope(env, s.cfg.MaxFrameSize)
-				if err != nil {
-					return
-				}
-				if err := WriteFrame(conn, s.cfg.MaxFrameSize, frame); err != nil {
-					return
-				}
+			case env = <-unaryCh:
 			case <-connDone:
+				return
+			default:
+				select {
+				case env = <-unaryCh:
+				case env = <-streamCh:
+				case <-connDone:
+					return
+				}
+			}
+			frame, err := EncodeEnvelope(env, s.cfg.MaxFrameSize)
+			if err != nil {
+				return
+			}
+			if err := WriteFrame(conn, s.cfg.MaxFrameSize, frame); err != nil {
 				return
 			}
 		}
 	}()
+
+	removeStream := func(id uint64) *serverStream {
+		requestsMu.Lock()
+		st := streams[id]
+		delete(streams, id)
+		requestsMu.Unlock()
+		return st
+	}
 
 	var readBuf []byte
 	readErr := error(nil)
@@ -207,17 +240,29 @@ func (s *Server) serveConn(conn net.Conn) {
 			if cancel != nil {
 				cancel()
 			}
+			if st := removeStream(env.ID); st != nil {
+				st.abort()
+			}
+		case TypeStream:
+			if env.Headers != nil && env.Headers[HeaderStreamAck] != "" {
+				requestsMu.Lock()
+				st := streams[env.ID]
+				requestsMu.Unlock()
+				if st != nil {
+					st.acked(parseAck(env.Headers[HeaderStreamAck]))
+				}
+			}
 		case TypeRequest:
 			if s.cfg.Authenticate != nil {
 				if err := s.cfg.Authenticate(env.Headers); err != nil {
-					s.sendError(writeCh, env, err)
+					s.sendError(unaryCh, env, err)
 					continue
 				}
 			}
 			select {
 			case semaphore <- struct{}{}:
 			default:
-				s.sendError(writeCh, env, ErrBusy)
+				s.sendError(unaryCh, env, ErrBusy)
 				continue
 			}
 			ctx, cancel := context.WithCancel(context.Background())
@@ -230,32 +275,51 @@ func (s *Server) serveConn(conn net.Conn) {
 					ctx, cancel = context.WithDeadline(context.Background(), deadline)
 				}
 			}
+			isStream := env.Headers != nil && env.Headers[HeaderStream] != ""
+			streamWindow := s.cfg.StreamWindow
+			if isStream {
+				if offered := parseAck(env.Headers[HeaderStream]); offered > 0 {
+					streamWindow = int(offered)
+				}
+			}
 			requestsMu.Lock()
 			requests[env.ID] = cancel
+			var st *serverStream
+			if isStream {
+				st = newServerStream(ctx, env.ID, streamCh, connDone, s.cfg.Codec.ID(), s.cfg.MaxFrameSize, streamWindow)
+				streams[env.ID] = st
+			}
 			requestsMu.Unlock()
 			active.Add(1)
-			go func(env *Envelope) {
+			go func(env *Envelope, st *serverStream) {
 				defer active.Done()
 				defer func() {
 					<-semaphore
 					cancel()
 					requestsMu.Lock()
 					delete(requests, env.ID)
+					if st != nil {
+						delete(streams, env.ID)
+					}
 					requestsMu.Unlock()
 				}()
+				if st != nil {
+					s.runStreamHandler(ctx, env, st)
+					return
+				}
 				payload, headers, callErr := s.dispatchSafe(ctx, env)
 				if ctx.Err() != nil {
 					return
 				}
 				if callErr != nil {
-					s.sendError(writeCh, env, callErr)
+					s.sendError(unaryCh, env, callErr)
 					return
 				}
 				select {
-				case writeCh <- &Envelope{Type: TypeResponse, ID: env.ID, Payload: payload, Headers: headers, Serializer: s.cfg.Codec.ID()}:
+				case unaryCh <- &Envelope{Type: TypeResponse, ID: env.ID, Payload: payload, Headers: headers, Serializer: s.cfg.Codec.ID()}:
 				case <-connDone:
 				}
-			}(env)
+			}(env, st)
 		default:
 			readErr = ErrBadFrame
 			shutdownRead = true
@@ -268,10 +332,42 @@ func (s *Server) serveConn(conn net.Conn) {
 	for _, cancel := range requests {
 		cancel()
 	}
+	for _, st := range streams {
+		st.abort()
+	}
 	requestsMu.Unlock()
 	active.Wait()
 	writeWG.Wait()
 	_ = readErr
+}
+
+func (s *Server) runStreamHandler(ctx context.Context, env *Envelope, st *serverStream) {
+	s.mu.RLock()
+	handler := s.streamHandlers[env.Method]
+	s.mu.RUnlock()
+	handlerErr := error(nil)
+	if handler == nil {
+		handlerErr = &CallError{Message: "lrpc: unknown streaming method: " + env.Method}
+	} else {
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					handlerErr = &CallError{Message: fmt.Sprintf("lrpc: handler panic: %v", recovered)}
+				}
+			}()
+			handlerErr = handler(ctx, env.Payload, env.Headers, st)
+		}()
+	}
+	// A canceled/disconnected request sends nothing more.
+	if ctx.Err() != nil {
+		st.abort()
+		return
+	}
+	if handlerErr != nil {
+		st.sendTerminal(handlerErr.Error())
+		return
+	}
+	st.sendTerminal("")
 }
 
 func (s *Server) dispatchSafe(ctx context.Context, env *Envelope) (payload []byte, headers map[string]string, err error) {

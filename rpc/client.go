@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 )
@@ -13,6 +14,7 @@ type ClientConfig struct {
 	MaxFrameSize int
 	MaxPending   int
 	WriteQueue   int
+	StreamWindow int
 	Headers      map[string]string
 	Codec        PayloadCodec
 }
@@ -33,10 +35,12 @@ type clientSession struct {
 	conn      net.Conn
 	writeCh   chan []byte
 	pending   map[uint64]chan *Envelope
+	streams   map[uint64]*streamMailbox
 	nextID    atomic.Uint64
 	mu        sync.Mutex
 	closed    chan struct{}
 	closeOnce sync.Once
+	writeMu   sync.Mutex
 }
 
 type pendingCall struct {
@@ -74,6 +78,9 @@ func withDefaults(cfg ClientConfig) ClientConfig {
 	if cfg.WriteQueue <= 0 {
 		cfg.WriteQueue = 1024
 	}
+	if cfg.StreamWindow <= 0 {
+		cfg.StreamWindow = defaultStreamWindow
+	}
 	if cfg.Codec == nil {
 		cfg.Codec = JSONCodec{}
 	}
@@ -94,6 +101,19 @@ func (c *Client) Close() error {
 		s.close(ErrConnectionClosed)
 	}
 	return nil
+}
+
+// DropConnection forcibly closes the current session, exactly like a network
+// failure. Pending calls and streams end with ErrConnectionClosed; the next
+// call opens a fresh session. It is useful for disconnect/reconnect drills.
+func (c *Client) DropConnection() {
+	c.mu.Lock()
+	s := c.session
+	c.session = nil
+	c.mu.Unlock()
+	if s != nil {
+		s.close(ErrConnectionClosed)
+	}
 }
 
 func (c *Client) Call(ctx context.Context, method string, arg any, reply any, headers map[string]string) (map[string]string, error) {
@@ -127,6 +147,72 @@ func (c *Client) Call(ctx context.Context, method string, arg any, reply any, he
 		}
 	}
 	return result.Headers, nil
+}
+
+// OpenStream starts a server-streaming call. Fragments are received via the
+// returned Stream. Canceling ctx or calling Stream.Cancel ends the call on
+// both ends and releases unconsumed fragments.
+func (c *Client) OpenStream(ctx context.Context, method string, arg any, headers map[string]string) (*Stream, error) {
+	payload, err := c.cfg.Codec.Encode(arg)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > c.cfg.MaxFrameSize {
+		return nil, ErrMessageTooLarge
+	}
+	merged := mergeHeaders(c.cfg.Headers, headers)
+	if merged == nil {
+		merged = map[string]string{}
+	}
+	merged[HeaderStream] = strconv.Itoa(c.cfg.StreamWindow)
+	env := &Envelope{Type: TypeRequest, Method: method, Payload: payload, Headers: merged, Serializer: c.cfg.Codec.ID()}
+	if deadline, ok := ctx.Deadline(); ok {
+		env.Headers["x-lrpc-deadline-unix-nano"] = formatDeadline(deadline)
+	}
+
+	s, err := c.sessionForCall(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	select {
+	case <-s.closed:
+		s.mu.Unlock()
+		return nil, ErrConnectionClosed
+	default:
+	}
+	if len(s.pending)+len(s.streams) >= c.cfg.MaxPending {
+		s.mu.Unlock()
+		return nil, ErrBusy
+	}
+	id := s.nextID.Add(1)
+	env.ID = id
+	mbox := newStreamMailbox()
+	s.streams[id] = mbox
+	s.mu.Unlock()
+
+	frame, err := EncodeEnvelope(env, c.cfg.MaxFrameSize)
+	if err != nil {
+		s.removeStream(id)
+		return nil, err
+	}
+	if err := s.enqueue(frame); err != nil {
+		s.removeStream(id)
+		return nil, err
+	}
+
+	stream := &Stream{s: s, id: id, method: method, cfg: c.cfg, mbox: mbox, codec: c.cfg.Codec, doneCh: make(chan struct{})}
+	go func() {
+		select {
+		case <-ctx.Done():
+			stream.Cancel()
+		case <-s.closed:
+			stream.fail(ErrConnectionClosed)
+		case <-stream.doneCh:
+		}
+	}()
+	return stream, nil
 }
 
 func (c *Client) sessionForCall(ctx context.Context) (*clientSession, error) {
@@ -180,6 +266,7 @@ func (c *Client) newSession(conn net.Conn) *clientSession {
 		conn:    conn,
 		writeCh: make(chan []byte, c.cfg.WriteQueue),
 		pending: make(map[uint64]chan *Envelope),
+		streams: make(map[uint64]*streamMailbox),
 		closed:  make(chan struct{}),
 	}
 	s.nextID.Store(fastrandID())
@@ -200,6 +287,8 @@ func (s *clientSession) send(ctx context.Context, env *Envelope, cfg ClientConfi
 		s.mu.Unlock()
 		return nil, ErrBusy
 	}
+	// Streaming openings share the pending slot budget so call volume stays
+	// bounded even before the first fragment arrives.
 	id := s.nextID.Add(1)
 	env.ID = id
 	done := make(chan *Envelope, 1)
@@ -248,8 +337,21 @@ func (s *clientSession) enqueue(frame []byte) error {
 
 func (s *clientSession) cancel(id uint64, method string, cfg ClientConfig) {
 	frame, err := EncodeEnvelope(&Envelope{Type: TypeCancel, ID: id, Method: method, Serializer: cfg.Codec.ID()}, cfg.MaxFrameSize)
-	if err == nil {
-		_ = s.enqueue(frame)
+	if err != nil {
+		return
+	}
+	// Write bypassing the queued data path: a cancel must leave even while a
+	// slow-stream backlog still occupies the shared connection.
+	s.writeControl(frame, cfg.MaxFrameSize)
+}
+
+func (s *clientSession) writeControl(frame []byte, maxSize int) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	select {
+	case <-s.closed:
+	default:
+		_ = WriteFrame(s.conn, maxSize, frame)
 	}
 }
 
@@ -282,6 +384,10 @@ func (s *clientSession) readLoop(maxSize int) {
 			}
 			return
 		}
+		if env.Type == TypeStream {
+			s.routeStream(env)
+			continue
+		}
 		if env.Type != TypeResponse && env.Type != TypeError {
 			continue
 		}
@@ -289,12 +395,40 @@ func (s *clientSession) readLoop(maxSize int) {
 	}
 }
 
+func (s *clientSession) routeStream(env *Envelope) {
+	s.mu.Lock()
+	mbox := s.streams[env.ID]
+	s.mu.Unlock()
+	if mbox == nil {
+		return
+	}
+	terminal := env.Error != "" || (env.Headers != nil && (env.Headers[HeaderStreamEnd] != "" || env.Headers[HeaderStreamError] != ""))
+	// Acks from the reader arrive here too.
+	if env.Headers != nil && env.Headers[HeaderStreamAck] != "" {
+		return
+	}
+	if terminal {
+		mbox.offer(env)
+	} else {
+		mbox.offer(env)
+	}
+}
+
+func (s *clientSession) removeStream(id uint64) {
+	s.mu.Lock()
+	delete(s.streams, id)
+	s.mu.Unlock()
+}
+
 func (s *clientSession) writeLoop(maxSize int) {
 	defer s.close(ErrConnectionClosed)
 	for {
 		select {
 		case frame := <-s.writeCh:
-			if err := WriteFrame(s.conn, maxSize, frame); err != nil {
+			s.writeMu.Lock()
+			err := WriteFrame(s.conn, maxSize, frame)
+			s.writeMu.Unlock()
+			if err != nil {
 				return
 			}
 		case <-s.closed:
@@ -314,6 +448,10 @@ func (s *clientSession) close(err error) {
 			case ch <- nil:
 			default:
 			}
+		}
+		for id, mbox := range s.streams {
+			delete(s.streams, id)
+			mbox.fail()
 		}
 		s.mu.Unlock()
 	})
