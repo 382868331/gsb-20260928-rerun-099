@@ -10,6 +10,7 @@ var (
 	ErrMessageTooLarge  = errors.New("lrpc: message too large")
 	ErrBadFrame         = errors.New("lrpc: bad frame")
 	ErrUnsupported      = errors.New("lrpc: unsupported operation")
+	ErrStreamClosed     = errors.New("lrpc: stream direction closed")
 )
 
 type CallError struct {

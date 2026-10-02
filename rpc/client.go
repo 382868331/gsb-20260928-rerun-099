@@ -36,8 +36,9 @@ type clientSession struct {
 	conn      net.Conn
 	reader    *bufio.Reader
 	writeCh   chan []byte
-	cancelCh  chan []byte
+	prioCh    chan []byte
 	pending   map[uint64]*pendingCall
+	bidi      map[uint64]*BidiStream
 	nextID    atomic.Uint64
 	mu        sync.Mutex
 	closed    chan struct{}
@@ -259,13 +260,14 @@ func (c *Client) connectLocked(ctx context.Context) (*clientSession, error) {
 
 func (c *Client) newSession(conn net.Conn) *clientSession {
 	s := &clientSession{
-		cfg:      c.cfg,
-		conn:     conn,
-		reader:   bufio.NewReader(conn),
-		writeCh:  make(chan []byte, c.cfg.WriteQueue),
-		cancelCh: make(chan []byte, 8),
-		pending:  make(map[uint64]*pendingCall),
-		closed:   make(chan struct{}),
+		cfg:     c.cfg,
+		conn:    conn,
+		reader:  bufio.NewReader(conn),
+		writeCh: make(chan []byte, c.cfg.WriteQueue),
+		prioCh:  make(chan []byte, 64),
+		pending: make(map[uint64]*pendingCall),
+		bidi:    make(map[uint64]*BidiStream),
+		closed:  make(chan struct{}),
 	}
 	s.nextID.Store(fastrandID())
 	go s.writeLoop(c.cfg.MaxFrameSize)
@@ -304,7 +306,7 @@ func (s *clientSession) begin(ctx context.Context, env *Envelope, cfg ClientConf
 		return nil, ErrConnectionClosed
 	default:
 	}
-	if len(s.pending) >= cfg.MaxPending {
+	if len(s.pending)+len(s.bidi) >= cfg.MaxPending {
 		s.mu.Unlock()
 		return nil, ErrBusy
 	}
@@ -323,13 +325,72 @@ func (s *clientSession) begin(ctx context.Context, env *Envelope, cfg ClientConf
 		s.remove(id)
 		return nil, err
 	}
-	if err := s.enqueue(frame); err != nil {
+	if err := s.enqueuePrio(frame); err != nil {
 		s.remove(id)
 		return nil, err
 	}
 	return call, nil
 }
 
+// Bidi 在当前连接上打开一条双向数据流，与普通请求和其他流并行。
+// 打开帧通过优先通道发送，不会被积压的流数据阻塞。
+func (c *Client) Bidi(ctx context.Context, method string, arg any, headers map[string]string) (*BidiStream, error) {
+	payload, err := c.cfg.Codec.Encode(arg)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > c.cfg.MaxFrameSize {
+		return nil, ErrMessageTooLarge
+	}
+	merged := mergeHeaders(c.cfg.Headers, headers)
+	env := &Envelope{Type: TypeRequest, Flags: FlagBidi, Method: method, Payload: payload, Headers: merged, Serializer: c.cfg.Codec.ID()}
+	if deadline, ok := ctx.Deadline(); ok {
+		if env.Headers == nil {
+			env.Headers = map[string]string{}
+		}
+		env.Headers["x-lrpc-deadline-unix-nano"] = formatDeadline(deadline)
+	}
+	s, err := c.sessionForCall(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	select {
+	case <-s.closed:
+		s.mu.Unlock()
+		return nil, ErrConnectionClosed
+	default:
+	}
+	if len(s.pending)+len(s.bidi) >= c.cfg.MaxPending {
+		s.mu.Unlock()
+		return nil, ErrBusy
+	}
+	id := s.nextID.Add(1)
+	env.ID = id
+	stream := &BidiStream{
+		session: s,
+		id:      id,
+		method:  method,
+		sender:  newBidiSender(),
+		recvCh:  make(chan *Envelope, bidiWindow+1),
+		done:    make(chan struct{}),
+	}
+	s.bidi[id] = stream
+	s.mu.Unlock()
+	frame, err := EncodeEnvelope(env, c.cfg.MaxFrameSize)
+	if err != nil {
+		s.removeBidi(id)
+		return nil, err
+	}
+	if err := s.enqueuePrio(frame); err != nil {
+		s.removeBidi(id)
+		return nil, err
+	}
+	return stream, nil
+}
+
+// enqueue 把普通数据帧放入写队列；写队列满时阻塞，
+// 每条流的窗口限制了单条流能占用的队列空间。
 func (s *clientSession) enqueue(frame []byte) error {
 	select {
 	case <-s.closed:
@@ -344,11 +405,27 @@ func (s *clientSession) enqueue(frame []byte) error {
 	}
 }
 
+// enqueuePrio 发送请求、取消、确认等优先帧，排在积压的流数据之前，
+// 慢数据流不会饿死短请求。
+func (s *clientSession) enqueuePrio(frame []byte) error {
+	select {
+	case <-s.closed:
+		return ErrConnectionClosed
+	default:
+	}
+	select {
+	case s.prioCh <- frame:
+		return nil
+	case <-s.closed:
+		return ErrConnectionClosed
+	}
+}
+
 func (s *clientSession) cancel(id uint64, method string, cfg ClientConfig) {
 	frame, err := EncodeEnvelope(&Envelope{Type: TypeCancel, ID: id, Method: method, Serializer: cfg.Codec.ID()}, cfg.MaxFrameSize)
 	if err == nil {
 		select {
-		case s.cancelCh <- frame:
+		case s.prioCh <- frame:
 		default:
 		}
 	}
@@ -358,10 +435,27 @@ func (s *clientSession) ack(id uint64, method string, cfg ClientConfig) {
 	frame, err := EncodeEnvelope(&Envelope{Type: TypeAck, ID: id, Method: method, Serializer: cfg.Codec.ID()}, cfg.MaxFrameSize)
 	if err == nil {
 		select {
-		case s.cancelCh <- frame:
+		case s.prioCh <- frame:
 		default:
 		}
 	}
+}
+
+func (s *clientSession) sendBidiAck(id uint64, seq uint64) {
+	cfg := s.cfg
+	frame, err := EncodeEnvelope(&Envelope{Type: TypeBidiAck, ID: id, Seq: seq, Serializer: cfg.Codec.ID()}, cfg.MaxFrameSize)
+	if err == nil {
+		select {
+		case s.prioCh <- frame:
+		default:
+		}
+	}
+}
+
+func (s *clientSession) removeBidi(id uint64) {
+	s.mu.Lock()
+	delete(s.bidi, id)
+	s.mu.Unlock()
 }
 
 func (s *clientSession) remove(id uint64) {
@@ -387,6 +481,25 @@ func (s *clientSession) readLoop(maxSize int) {
 			}
 			return
 		}
+		if env.Type == TypeBidiData || env.Type == TypeBidiAck || env.Type == TypeError {
+			s.mu.Lock()
+			stream := s.bidi[env.ID]
+			s.mu.Unlock()
+			if stream != nil {
+				switch env.Type {
+				case TypeBidiAck:
+					stream.sender.ack(env.Seq)
+				default:
+					select {
+					case stream.recvCh <- env:
+					case <-stream.done:
+					case <-s.closed:
+						return
+					}
+				}
+				continue
+			}
+		}
 		if env.Type != TypeResponse && env.Type != TypeError && env.Type != TypeStream {
 			continue
 		}
@@ -408,9 +521,8 @@ func (s *clientSession) readLoop(maxSize int) {
 func (s *clientSession) writeLoop(maxSize int) {
 	defer s.close(ErrConnectionClosed)
 	for {
-		writeCh := s.writeCh
 		select {
-		case frame := <-s.cancelCh:
+		case frame := <-s.prioCh:
 			if err := WriteFrame(s.conn, maxSize, frame); err != nil {
 				return
 			}
@@ -418,11 +530,11 @@ func (s *clientSession) writeLoop(maxSize int) {
 		default:
 		}
 		select {
-		case frame := <-s.cancelCh:
+		case frame := <-s.prioCh:
 			if err := WriteFrame(s.conn, maxSize, frame); err != nil {
 				return
 			}
-		case frame := <-writeCh:
+		case frame := <-s.writeCh:
 			if err := WriteFrame(s.conn, maxSize, frame); err != nil {
 				return
 			}
@@ -441,6 +553,14 @@ func (s *clientSession) close(err error) {
 			delete(s.pending, id)
 			call.closeOnce.Do(func() { close(call.done) })
 		}
+		streams := make([]*BidiStream, 0, len(s.bidi))
+		for id, stream := range s.bidi {
+			delete(s.bidi, id)
+			streams = append(streams, stream)
+		}
 		s.mu.Unlock()
+		for _, stream := range streams {
+			stream.once.Do(func() { close(stream.done) })
+		}
 	})
 }

@@ -14,6 +14,7 @@ import (
 
 type RawHandler func(ctx context.Context, payload []byte, headers map[string]string) ([]byte, map[string]string, error)
 type RawStreamHandler func(ctx context.Context, payload []byte, headers map[string]string, stream *ServerStream) error
+type RawBidiHandler func(ctx context.Context, payload []byte, headers map[string]string, stream *ServerBidiStream) error
 
 type Authenticator func(headers map[string]string) error
 
@@ -32,6 +33,7 @@ type Server struct {
 	mu             sync.RWMutex
 	handlers       map[string]RawHandler
 	streamHandlers map[string]RawStreamHandler
+	bidiHandlers   map[string]RawBidiHandler
 	listener       net.Listener
 	closed         chan struct{}
 	closeMu        sync.Mutex
@@ -56,7 +58,7 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.HeaderTimeout <= 0 {
 		cfg.HeaderTimeout = time.Minute
 	}
-	return &Server{cfg: cfg, handlers: make(map[string]RawHandler), streamHandlers: make(map[string]RawStreamHandler), closed: make(chan struct{}), active: make(map[net.Conn]struct{})}
+	return &Server{cfg: cfg, handlers: make(map[string]RawHandler), streamHandlers: make(map[string]RawStreamHandler), bidiHandlers: make(map[string]RawBidiHandler), closed: make(chan struct{}), active: make(map[net.Conn]struct{})}
 }
 
 func (s *Server) Handle(method string, handler RawHandler) {
@@ -69,6 +71,21 @@ func (s *Server) HandleStream(method string, handler RawStreamHandler) {
 	s.mu.Lock()
 	s.streamHandlers[method] = handler
 	s.mu.Unlock()
+}
+
+func (s *Server) HandleBidi(method string, handler RawBidiHandler) {
+	s.mu.Lock()
+	s.bidiHandlers[method] = handler
+	s.mu.Unlock()
+}
+
+// serverBidi 是服务端一条双向流的连接级状态。
+type serverBidi struct {
+	id       uint64
+	sender   bidiSender
+	recvCh   chan *Envelope
+	sendAck  func(seq uint64)
+	draining bool // 处理器已返回：继续确认并丢弃对方剩余分段，直到对方半关闭
 }
 
 type serverWriteReq struct {
@@ -186,9 +203,10 @@ func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 
 	connDone := make(chan struct{})
-	writeCh := make(chan serverWriteReq)
+	writeCh := make(chan serverWriteReq, s.cfg.WriteQueue)
 	requests := make(map[uint64]context.CancelFunc)
 	streamAcks := make(map[uint64]chan *Envelope)
+	bidiStreams := make(map[uint64]*serverBidi)
 	var requestsMu sync.Mutex
 	semaphore := make(chan struct{}, s.cfg.MaxHandlers)
 	var active sync.WaitGroup
@@ -220,6 +238,25 @@ func (s *Server) serveConn(conn net.Conn) {
 		}
 	}()
 
+	writeEnv := func(outCtx context.Context, out *Envelope) error {
+		req := serverWriteReq{env: out, errCh: make(chan error, 1)}
+		select {
+		case writeCh <- req:
+			select {
+			case err := <-req.errCh:
+				return err
+			case <-outCtx.Done():
+				return outCtx.Err()
+			case <-connDone:
+				return ErrConnectionClosed
+			}
+		case <-outCtx.Done():
+			return outCtx.Err()
+		case <-connDone:
+			return ErrConnectionClosed
+		}
+	}
+
 	reader := bufio.NewReader(conn)
 	readErr := error(nil)
 	shutdownRead := false
@@ -248,6 +285,35 @@ func (s *Server) serveConn(conn net.Conn) {
 			break
 		}
 		switch env.Type {
+		case TypeBidiData:
+			requestsMu.Lock()
+			st := bidiStreams[env.ID]
+			if st != nil && st.draining {
+				// 处理器已结束：确认并丢弃，对方半关闭后移除流状态。
+				st.sendAck(env.Seq)
+				if env.Flags&FlagEnd != 0 {
+					delete(bidiStreams, env.ID)
+				}
+				requestsMu.Unlock()
+				continue
+			}
+			requestsMu.Unlock()
+			if st != nil {
+				select {
+				case st.recvCh <- env:
+				default:
+					// 对方违反发送窗口，协议错误，只关闭这条连接。
+					readErr = ErrBadFrame
+					shutdownRead = true
+				}
+			}
+		case TypeBidiAck:
+			requestsMu.Lock()
+			st := bidiStreams[env.ID]
+			requestsMu.Unlock()
+			if st != nil {
+				st.sender.ack(env.Seq)
+			}
 		case TypeAck:
 			requestsMu.Lock()
 			ack := streamAcks[env.ID]
@@ -295,6 +361,19 @@ func (s *Server) serveConn(conn net.Conn) {
 				ackCh = make(chan *Envelope, 1)
 				streamAcks[env.ID] = ackCh
 			}
+			bidiCall := env.Flags&FlagBidi != 0
+			var st *serverBidi
+			if bidiCall {
+				st = &serverBidi{
+					id:     env.ID,
+					sender: newBidiSender(),
+					recvCh: make(chan *Envelope, bidiWindow+1),
+				}
+				st.sendAck = func(seq uint64) {
+					_ = writeEnv(context.Background(), &Envelope{Type: TypeBidiAck, ID: env.ID, Seq: seq, Serializer: s.cfg.Codec.ID()})
+				}
+				bidiStreams[env.ID] = st
+			}
 			requestsMu.Unlock()
 			streamCall := env.Flags&FlagStream != 0
 			active.Add(1)
@@ -306,25 +385,30 @@ func (s *Server) serveConn(conn net.Conn) {
 					requestsMu.Lock()
 					delete(requests, env.ID)
 					delete(streamAcks, env.ID)
+					if bidiCall {
+						// 流状态保留到对方半关闭或连接断开，避免对方发送方永久阻塞。
+						st.draining = true
+					}
 					requestsMu.Unlock()
 				}()
-				writeEnv := func(outCtx context.Context, out *Envelope) error {
-					req := serverWriteReq{env: out, errCh: make(chan error, 1)}
-					select {
-					case writeCh <- req:
-						select {
-						case err := <-req.errCh:
-							return err
-						case <-outCtx.Done():
-							return outCtx.Err()
-						case <-connDone:
-							return ErrConnectionClosed
-						}
-					case <-outCtx.Done():
-						return outCtx.Err()
-					case <-connDone:
-						return ErrConnectionClosed
+				if bidiCall {
+					stream := &ServerBidiStream{
+						id:         env.ID,
+						serializer: s.cfg.Codec.ID(),
+						st:         st,
+						write:      writeEnv,
+						connDone:   connDone,
 					}
+					callErr := s.dispatchBidiSafe(ctx, env, stream)
+					if callErr != nil {
+						if ctx.Err() == nil {
+							_ = writeEnv(context.Background(), &Envelope{Type: TypeError, ID: env.ID, Error: callErr.Error(), Serializer: s.cfg.Codec.ID()})
+						}
+						return
+					}
+					// 处理器返回即服务端发送方向结束，自动半关闭。
+					_ = stream.CloseSend(context.Background())
+					return
 				}
 				if streamCall {
 					stream := &ServerStream{
@@ -417,6 +501,21 @@ func (s *Server) dispatchStreamSafe(ctx context.Context, env *Envelope, stream *
 	s.mu.RUnlock()
 	if handler == nil {
 		return &CallError{Message: "lrpc: unknown stream method: " + env.Method}
+	}
+	return handler(ctx, env.Payload, env.Headers, stream)
+}
+
+func (s *Server) dispatchBidiSafe(ctx context.Context, env *Envelope, stream *ServerBidiStream) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = &CallError{Message: fmt.Sprintf("lrpc: bidi handler panic: %v", recovered)}
+		}
+	}()
+	s.mu.RLock()
+	handler := s.bidiHandlers[env.Method]
+	s.mu.RUnlock()
+	if handler == nil {
+		return &CallError{Message: "lrpc: unknown bidi method: " + env.Method}
 	}
 	return handler(ctx, env.Payload, env.Headers, stream)
 }
