@@ -3,6 +3,7 @@ package demo
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync/atomic"
 	"time"
 
@@ -46,6 +47,15 @@ type NumbersItem struct {
 
 type WatchRequest struct {
 	ID string `json:"id"`
+}
+
+type ChatRequest struct {
+	ID string `json:"id"`
+}
+
+type ChatMessage struct {
+	Seq  int    `json:"seq"`
+	Text string `json:"text"`
 }
 
 type StatusRequest struct{}
@@ -99,6 +109,30 @@ func Watch(ctx context.Context, req *WatchRequest, out *rpc.TypedServerStream[Nu
 	<-ctx.Done()
 	CanceledWatches.Add(1)
 	return ctx.Err()
+}
+
+func Chat(ctx context.Context, req *ChatRequest, stream *rpc.ServerBidiStream) error {
+	codec := rpc.JSONCodec{}
+	count := 0
+	for {
+		msg, err := rpc.BidiRecv[ChatMessage](ctx, codec, stream.Recv)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		count++
+		echo := ChatMessage{Seq: msg.Seq, Text: "echo:" + msg.Text}
+		if err := rpc.BidiSend(ctx, codec, stream.Send, echo); err != nil {
+			return err
+		}
+	}
+	summary := ChatMessage{Seq: -1, Text: fmt.Sprintf("done:%d", count)}
+	if err := rpc.BidiSend(ctx, codec, stream.Send, summary); err != nil {
+		return err
+	}
+	return stream.CloseSend(ctx)
 }
 
 func Status(context.Context, *StatusRequest) (StatusResponse, error) {

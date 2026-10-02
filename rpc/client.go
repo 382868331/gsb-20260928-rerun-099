@@ -50,6 +50,7 @@ type pendingCall struct {
 	ch        chan *Envelope
 	done      chan struct{}
 	stream    bool
+	bidi      *BidiStream
 	closeOnce sync.Once
 }
 
@@ -192,7 +193,7 @@ func (s *Stream) Recv(ctx context.Context) ([]byte, map[string]string, error) {
 				s.session.remove(s.call.id)
 				return env.Payload, env.Headers, io.EOF
 			}
-			s.session.ack(s.call.id, s.call.method, s.session.cfg)
+			s.session.ack(s.call.id, s.call.method, s.session.cfg, env.Seq)
 			return env.Payload, env.Headers, nil
 		case TypeResponse:
 			s.session.remove(s.call.id)
@@ -297,6 +298,14 @@ func (s *clientSession) send(ctx context.Context, env *Envelope, cfg ClientConfi
 }
 
 func (s *clientSession) begin(ctx context.Context, env *Envelope, cfg ClientConfig, stream bool) (*pendingCall, error) {
+	return s.beginCall(env, cfg, stream, nil)
+}
+
+func (s *clientSession) beginBidi(env *Envelope, cfg ClientConfig, bidi *BidiStream) (*pendingCall, error) {
+	return s.beginCall(env, cfg, false, bidi)
+}
+
+func (s *clientSession) beginCall(env *Envelope, cfg ClientConfig, stream bool, bidi *BidiStream) (*pendingCall, error) {
 	s.mu.Lock()
 	select {
 	case <-s.closed:
@@ -314,7 +323,10 @@ func (s *clientSession) begin(ctx context.Context, env *Envelope, cfg ClientConf
 	if stream {
 		chSize = 0
 	}
-	call := &pendingCall{id: id, method: env.Method, ch: make(chan *Envelope, chSize), done: make(chan struct{}), stream: stream}
+	if bidi != nil {
+		chSize = 2
+	}
+	call := &pendingCall{id: id, method: env.Method, ch: make(chan *Envelope, chSize), done: make(chan struct{}), stream: stream, bidi: bidi}
 	s.pending[id] = call
 	s.mu.Unlock()
 
@@ -344,6 +356,22 @@ func (s *clientSession) enqueue(frame []byte) error {
 	}
 }
 
+func (s *clientSession) enqueueCtx(ctx context.Context, frame []byte) error {
+	select {
+	case <-s.closed:
+		return ErrConnectionClosed
+	default:
+	}
+	select {
+	case s.writeCh <- frame:
+		return nil
+	case <-s.closed:
+		return ErrConnectionClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (s *clientSession) cancel(id uint64, method string, cfg ClientConfig) {
 	frame, err := EncodeEnvelope(&Envelope{Type: TypeCancel, ID: id, Method: method, Serializer: cfg.Codec.ID()}, cfg.MaxFrameSize)
 	if err == nil {
@@ -354,13 +382,27 @@ func (s *clientSession) cancel(id uint64, method string, cfg ClientConfig) {
 	}
 }
 
-func (s *clientSession) ack(id uint64, method string, cfg ClientConfig) {
-	frame, err := EncodeEnvelope(&Envelope{Type: TypeAck, ID: id, Method: method, Serializer: cfg.Codec.ID()}, cfg.MaxFrameSize)
+func (s *clientSession) ack(id uint64, method string, cfg ClientConfig, seq uint64) {
+	frame, err := EncodeEnvelope(&Envelope{Type: TypeAck, ID: id, Seq: seq, Method: method, Serializer: cfg.Codec.ID()}, cfg.MaxFrameSize)
 	if err == nil {
 		select {
 		case s.cancelCh <- frame:
 		default:
 		}
+	}
+}
+
+// ackBidi delivers a flow-control ack for a bidirectional stream. Unlike
+// the best-effort variant it cannot be dropped silently: a lost ack would
+// deadlock the peer's send window.
+func (s *clientSession) ackBidi(id uint64, method string, cfg ClientConfig, seq uint64) {
+	frame, err := EncodeEnvelope(&Envelope{Type: TypeAck, ID: id, Seq: seq, Method: method, Serializer: cfg.Codec.ID()}, cfg.MaxFrameSize)
+	if err != nil {
+		return
+	}
+	select {
+	case s.cancelCh <- frame:
+	case <-s.closed:
 	}
 }
 
@@ -387,13 +429,22 @@ func (s *clientSession) readLoop(maxSize int) {
 			}
 			return
 		}
-		if env.Type != TypeResponse && env.Type != TypeError && env.Type != TypeStream {
+		if env.Type != TypeResponse && env.Type != TypeError && env.Type != TypeStream && env.Type != TypeAck && env.Type != TypeCancel {
 			continue
 		}
 		s.mu.Lock()
 		call := s.pending[env.ID]
 		s.mu.Unlock()
 		if call == nil {
+			continue
+		}
+		if call.bidi != nil {
+			if !call.bidi.onEnvelope(env) {
+				return
+			}
+			continue
+		}
+		if env.Type != TypeResponse && env.Type != TypeError && env.Type != TypeStream {
 			continue
 		}
 		select {

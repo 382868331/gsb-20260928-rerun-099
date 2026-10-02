@@ -68,3 +68,40 @@ func (s *TypedStream[Item]) Recv(ctx context.Context) (Item, map[string]string, 
 func (s *TypedStream[Item]) Close() error { return s.raw.Close() }
 
 func IsEnd(err error) bool { return err == io.EOF }
+
+type TypedBidiHandler[Arg any] func(context.Context, *Arg, *ServerBidiStream) error
+
+func HandleBidi[Arg any](s *Server, method string, fn TypedBidiHandler[Arg]) {
+	codec := s.cfg.Codec
+	s.HandleBidi(method, func(ctx context.Context, payload []byte, headers map[string]string, stream *ServerBidiStream) error {
+		var arg Arg
+		if err := codec.Decode(payload, &arg); err != nil {
+			return err
+		}
+		return fn(ctx, &arg, stream)
+	})
+}
+
+func CallBidi[Arg any](ctx context.Context, c *Client, method string, arg Arg, headers map[string]string) (*BidiStream, error) {
+	return c.BidiStream(ctx, method, arg, headers)
+}
+
+func BidiSend[Item any](ctx context.Context, codec PayloadCodec, send func(context.Context, []byte, map[string]string) error, item Item) error {
+	payload, err := codec.Encode(item)
+	if err != nil {
+		return err
+	}
+	return send(ctx, payload, nil)
+}
+
+func BidiRecv[Item any](ctx context.Context, codec PayloadCodec, recv func(context.Context) ([]byte, map[string]string, error)) (Item, error) {
+	var item Item
+	payload, _, err := recv(ctx)
+	if err != nil {
+		return item, err
+	}
+	if err := codec.Decode(payload, &item); err != nil {
+		return item, err
+	}
+	return item, nil
+}

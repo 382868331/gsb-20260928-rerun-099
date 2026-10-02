@@ -25,6 +25,7 @@ func main() {
 	rpc.HandleTyped(server, "demo.Status", demo.Status)
 	rpc.HandleStream(server, "demo.Numbers", demo.Numbers)
 	rpc.HandleStream(server, "demo.Watch", demo.Watch)
+	rpc.HandleBidi(server, "demo.Chat", demo.Chat)
 
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {

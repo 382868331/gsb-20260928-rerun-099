@@ -16,11 +16,14 @@ const (
 	TypeStream   byte = 5
 	TypeAck      byte = 6
 	FlagStream   byte = 1
+	FlagEnd      byte = 2
+	FlagBidi     byte = 4
 )
 
 type Envelope struct {
 	Type       byte
 	ID         uint64
+	Seq        uint64
 	Method     string
 	Error      string
 	Headers    map[string]string
@@ -30,7 +33,7 @@ type Envelope struct {
 }
 
 func EncodeEnvelope(e *Envelope, maxSize int) ([]byte, error) {
-	size := 1 + 1 + 1 + 1 + 8 + 2 + len(e.Method) + 2 + len(e.Error) + 2
+	size := 1 + 1 + 1 + 1 + 8 + 8 + 2 + len(e.Method) + 2 + len(e.Error) + 2
 	for key, value := range e.Headers {
 		size += 2 + len(key) + 2 + len(value)
 	}
@@ -48,6 +51,7 @@ func EncodeEnvelope(e *Envelope, maxSize int) ([]byte, error) {
 	b = append(b, serializer)
 	b = append(b, e.Flags)
 	b = binary.BigEndian.AppendUint64(b, e.ID)
+	b = binary.BigEndian.AppendUint64(b, e.Seq)
 	b = appendString(b, e.Method)
 	b = appendString(b, e.Error)
 	b = binary.BigEndian.AppendUint16(b, uint16(len(e.Headers)))
@@ -61,7 +65,7 @@ func EncodeEnvelope(e *Envelope, maxSize int) ([]byte, error) {
 }
 
 func DecodeEnvelope(frame []byte) (*Envelope, error) {
-	if len(frame) < 16 {
+	if len(frame) < 20 {
 		return nil, ErrBadFrame
 	}
 	pos := 0
@@ -84,6 +88,8 @@ func DecodeEnvelope(frame []byte) (*Envelope, error) {
 		return nil, fmt.Errorf("%w: unsupported serializer", ErrBadFrame)
 	}
 	e.ID = binary.BigEndian.Uint64(frame[pos:])
+	pos += 8
+	e.Seq = binary.BigEndian.Uint64(frame[pos:])
 	pos += 8
 	method, next, err := readString(frame, pos)
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"time"
 
 	"lrpc/demo"
@@ -30,6 +31,7 @@ func main() {
 	switch *phase {
 	case "stream", "all":
 		runStreamPhase(client)
+		runBidiPhase(client)
 		runReconnectPhase(client)
 		_ = client.Close()
 	case "reconnect":
@@ -102,6 +104,49 @@ func runStreamPhase(client *rpc.Client) {
 		log.Fatalf("status: %v", err)
 	}
 	fmt.Printf("server canceled_watches=%d state=observed\n", status.CanceledWatches)
+}
+
+func runBidiPhase(client *rpc.Client) {
+	chat, err := rpc.CallBidi[demo.ChatRequest](context.Background(), client, "demo.Chat", demo.ChatRequest{ID: "room-1"}, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	sizes := []int{4, 64, 1024, 16, 256}
+	for i, size := range sizes {
+		text := strings.Repeat("m", size)
+		if err := rpc.BidiSend(context.Background(), rpc.JSONCodec{}, chat.Send, demo.ChatMessage{Seq: i + 1, Text: text}); err != nil {
+			log.Fatalf("bidi send %d: %v", i+1, err)
+		}
+		echo, err := rpc.BidiRecv[demo.ChatMessage](context.Background(), rpc.JSONCodec{}, chat.Recv)
+		if err != nil {
+			log.Fatalf("bidi recv %d: %v", i+1, err)
+		}
+		if echo.Seq != i+1 || echo.Text != "echo:"+text {
+			log.Fatalf("bidi echo %d mismatch", i+1)
+		}
+	}
+	if err := chat.CloseSend(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+	sum, _, err := rpc.Call[demo.AddRequest, demo.AddResponse](context.Background(), client, "demo.Add", demo.AddRequest{A: 1, B: 2}, nil)
+	if err != nil || sum.Sum != 3 {
+		log.Fatalf("unary during half-closed bidi: %+v, %v", sum, err)
+	}
+	summary, err := rpc.BidiRecv[demo.ChatMessage](context.Background(), rpc.JSONCodec{}, chat.Recv)
+	if err != nil {
+		log.Fatalf("bidi summary: %v", err)
+	}
+	if summary.Text != "done:5" {
+		log.Fatalf("bidi summary = %q", summary.Text)
+	}
+	if _, err := rpc.BidiRecv[demo.ChatMessage](context.Background(), rpc.JSONCodec{}, chat.Recv); err != io.EOF {
+		log.Fatalf("bidi final recv = %v", err)
+	}
+	state := chat.State()
+	if !state.Done || state.Err != nil || state.Sent != 5 || state.Acked != 5 || state.Received != 6 {
+		log.Fatalf("bidi final state: %+v", state)
+	}
+	fmt.Printf("bidi sent=%d acked=%d received=%d state=eof\n", state.Sent, state.Acked, state.Received)
 }
 
 func runReconnectPhase(client *rpc.Client) {

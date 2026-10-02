@@ -14,6 +14,7 @@ import (
 
 type RawHandler func(ctx context.Context, payload []byte, headers map[string]string) ([]byte, map[string]string, error)
 type RawStreamHandler func(ctx context.Context, payload []byte, headers map[string]string, stream *ServerStream) error
+type RawBidiHandler func(ctx context.Context, payload []byte, headers map[string]string, stream *ServerBidiStream) error
 
 type Authenticator func(headers map[string]string) error
 
@@ -32,6 +33,7 @@ type Server struct {
 	mu             sync.RWMutex
 	handlers       map[string]RawHandler
 	streamHandlers map[string]RawStreamHandler
+	bidiHandlers   map[string]RawBidiHandler
 	listener       net.Listener
 	closed         chan struct{}
 	closeMu        sync.Mutex
@@ -56,7 +58,7 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.HeaderTimeout <= 0 {
 		cfg.HeaderTimeout = time.Minute
 	}
-	return &Server{cfg: cfg, handlers: make(map[string]RawHandler), streamHandlers: make(map[string]RawStreamHandler), closed: make(chan struct{}), active: make(map[net.Conn]struct{})}
+	return &Server{cfg: cfg, handlers: make(map[string]RawHandler), streamHandlers: make(map[string]RawStreamHandler), bidiHandlers: make(map[string]RawBidiHandler), closed: make(chan struct{}), active: make(map[net.Conn]struct{})}
 }
 
 func (s *Server) Handle(method string, handler RawHandler) {
@@ -68,6 +70,12 @@ func (s *Server) Handle(method string, handler RawHandler) {
 func (s *Server) HandleStream(method string, handler RawStreamHandler) {
 	s.mu.Lock()
 	s.streamHandlers[method] = handler
+	s.mu.Unlock()
+}
+
+func (s *Server) HandleBidi(method string, handler RawBidiHandler) {
+	s.mu.Lock()
+	s.bidiHandlers[method] = handler
 	s.mu.Unlock()
 }
 
@@ -189,6 +197,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	writeCh := make(chan serverWriteReq)
 	requests := make(map[uint64]context.CancelFunc)
 	streamAcks := make(map[uint64]chan *Envelope)
+	bidiData := make(map[uint64]chan *Envelope)
 	var requestsMu sync.Mutex
 	semaphore := make(chan struct{}, s.cfg.MaxHandlers)
 	var active sync.WaitGroup
@@ -248,6 +257,20 @@ func (s *Server) serveConn(conn net.Conn) {
 			break
 		}
 		switch env.Type {
+		case TypeStream:
+			requestsMu.Lock()
+			dataCh := bidiData[env.ID]
+			requestsMu.Unlock()
+			if dataCh == nil {
+				s.sendControl(writeCh, connDone, &Envelope{Type: TypeCancel, ID: env.ID, Serializer: s.cfg.Codec.ID()})
+				continue
+			}
+			select {
+			case dataCh <- env:
+			default:
+				readErr = ErrBadFrame
+				shutdownRead = true
+			}
 		case TypeAck:
 			requestsMu.Lock()
 			ack := streamAcks[env.ID]
@@ -291,12 +314,18 @@ func (s *Server) serveConn(conn net.Conn) {
 			requestsMu.Lock()
 			requests[env.ID] = cancel
 			var ackCh chan *Envelope
-			if env.Flags&FlagStream != 0 {
+			var dataCh chan *Envelope
+			if env.Flags&FlagStream != 0 || env.Flags&FlagBidi != 0 {
 				ackCh = make(chan *Envelope, 1)
 				streamAcks[env.ID] = ackCh
 			}
+			if env.Flags&FlagBidi != 0 {
+				dataCh = make(chan *Envelope, 2)
+				bidiData[env.ID] = dataCh
+			}
 			requestsMu.Unlock()
 			streamCall := env.Flags&FlagStream != 0
+			bidiCall := env.Flags&FlagBidi != 0
 			active.Add(1)
 			go func(env *Envelope) {
 				defer active.Done()
@@ -306,6 +335,7 @@ func (s *Server) serveConn(conn net.Conn) {
 					requestsMu.Lock()
 					delete(requests, env.ID)
 					delete(streamAcks, env.ID)
+					delete(bidiData, env.ID)
 					requestsMu.Unlock()
 				}()
 				writeEnv := func(outCtx context.Context, out *Envelope) error {
@@ -325,6 +355,35 @@ func (s *Server) serveConn(conn net.Conn) {
 					case <-connDone:
 						return ErrConnectionClosed
 					}
+				}
+				if bidiCall {
+					stream := &ServerBidiStream{
+						id:         env.ID,
+						serializer: s.cfg.Codec.ID(),
+						write:      writeEnv,
+						ackCh:      ackCh,
+						dataCh:     dataCh,
+						connDone:   connDone,
+					}
+					callErr := s.dispatchBidiSafe(ctx, env, stream)
+					if ctx.Err() != nil {
+						return
+					}
+					if callErr != nil {
+						_ = writeEnv(context.Background(), &Envelope{Type: TypeError, ID: env.ID, Error: callErr.Error(), Serializer: s.cfg.Codec.ID()})
+						return
+					}
+					if !stream.SendClosed() {
+						_ = stream.CloseSend(context.Background())
+					}
+					if !stream.RemoteClosed() {
+						// The handler returned while the peer may still send:
+						// reset the inbound direction so the peer is never left
+						// waiting silently. The outbound direction already ended
+						// cleanly with the half-close above.
+						_ = writeEnv(context.Background(), &Envelope{Type: TypeCancel, ID: env.ID, Serializer: s.cfg.Codec.ID()})
+					}
+					return
 				}
 				if streamCall {
 					stream := &ServerStream{
@@ -419,6 +478,35 @@ func (s *Server) dispatchStreamSafe(ctx context.Context, env *Envelope, stream *
 		return &CallError{Message: "lrpc: unknown stream method: " + env.Method}
 	}
 	return handler(ctx, env.Payload, env.Headers, stream)
+}
+
+func (s *Server) dispatchBidiSafe(ctx context.Context, env *Envelope, stream *ServerBidiStream) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = &CallError{Message: fmt.Sprintf("lrpc: bidi handler panic: %v", recovered)}
+		}
+	}()
+	s.mu.RLock()
+	handler := s.bidiHandlers[env.Method]
+	s.mu.RUnlock()
+	if handler == nil {
+		return &CallError{Message: "lrpc: unknown bidi method: " + env.Method}
+	}
+	return handler(ctx, env.Payload, env.Headers, stream)
+}
+
+func (s *Server) sendControl(writeCh chan<- serverWriteReq, connDone <-chan struct{}, env *Envelope) {
+	go func() {
+		req := serverWriteReq{env: env, errCh: make(chan error, 1)}
+		select {
+		case writeCh <- req:
+			select {
+			case <-req.errCh:
+			case <-connDone:
+			}
+		case <-connDone:
+		}
+	}()
 }
 
 func (s *Server) sendError(writeCh chan<- serverWriteReq, connDone <-chan struct{}, request *Envelope, err error) {
