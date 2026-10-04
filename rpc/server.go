@@ -357,12 +357,14 @@ func (s *Server) serveConn(conn net.Conn) {
 			if env.Flags&FlagBidi != 0 {
 				bidiStream = &ServerBidiStream{
 					id:         env.ID,
+					method:     env.Method,
 					serializer: s.cfg.Codec.ID(),
 					ackCh:      ackCh,
 					dataCh:     make(chan *Envelope, 2),
 					resetCh:    make(chan struct{}),
 					connDone:   connDone,
 					credits:    credits,
+					sizes:      make(map[uint64]int),
 				}
 				bidiStreams[env.ID] = bidiStream
 			}

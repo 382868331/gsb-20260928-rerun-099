@@ -96,6 +96,7 @@ type BidiStream struct {
 	recvClosed bool
 	completed  bool
 	termErr    error
+	sizes      map[uint64]int
 }
 
 func (c *Client) BidiStream(ctx context.Context, method string, arg any, headers map[string]string) (*BidiStream, error) {
@@ -118,7 +119,7 @@ func (c *Client) BidiStream(ctx context.Context, method string, arg any, headers
 	if err != nil {
 		return nil, err
 	}
-	stream := &BidiStream{ackCh: make(chan uint64, 4)}
+	stream := &BidiStream{ackCh: make(chan uint64, 4), sizes: make(map[uint64]int)}
 	call, err := s.beginBidi(env, c.cfg, stream)
 	if err != nil {
 		return nil, err
@@ -172,6 +173,7 @@ func (s *BidiStream) Send(ctx context.Context, payload []byte, headers map[strin
 	}
 	s.mu.Lock()
 	s.sent = seq
+	s.sizes[seq] = len(payload)
 	s.mu.Unlock()
 	waitReleased := false
 	release := func() {
@@ -322,6 +324,47 @@ func (s *BidiStream) State() BidiState {
 	return state
 }
 
+// Snapshot copies the stream's diagnostic facts and the connection-shared
+// credit state. The value remains usable after the stream and connection
+// close; it does not retry, replay, or alter any request.
+func (s *BidiStream) Snapshot() StreamSnapshot {
+	s.mu.Lock()
+	sizes := make(map[uint64]int, len(s.sizes))
+	for seq, size := range s.sizes {
+		sizes[seq] = size
+	}
+	snap := StreamSnapshot{
+		StreamID:      s.call.id,
+		Method:        s.call.method,
+		Sent:          s.sent,
+		Acked:         s.acked,
+		Received:      s.received,
+		SegmentSizes:  sizes,
+		SendClosed:    s.sendClosed,
+		ReceiveClosed: s.recvClosed,
+	}
+	if s.termErr != nil {
+		snap.CloseReason = s.termErr
+	}
+	s.mu.Unlock()
+
+	select {
+	case <-s.call.done:
+		snap.Done = true
+		if snap.CloseReason == nil {
+			snap.CloseReason = ErrConnectionClosed
+		}
+	default:
+	}
+	if session := s.session; session != nil {
+		snap.Connection = session.diagnosticSnapshot()
+		if snap.Done && snap.Connection.Closed {
+			snap.CloseReason = ErrConnectionClosed
+		}
+	}
+	return snap
+}
+
 func (s *BidiStream) terminalErr() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -406,6 +449,7 @@ func (s *BidiStream) onEnvelope(env *Envelope) bool {
 // the peer is never left waiting without a signal.
 type ServerBidiStream struct {
 	id         uint64
+	method     string
 	serializer byte
 	write      func(context.Context, *Envelope) error
 	ackCh      chan *Envelope
@@ -425,6 +469,7 @@ type ServerBidiStream struct {
 	sendClosed   bool
 	remoteClosed bool
 	resetClosed  bool
+	sizes        map[uint64]int
 }
 
 func (s *ServerBidiStream) Send(ctx context.Context, payload []byte, headers map[string]string) error {
@@ -448,6 +493,7 @@ func (s *ServerBidiStream) Send(ctx context.Context, payload []byte, headers map
 	}
 	s.mu.Lock()
 	s.sent = seq
+	s.sizes[seq] = len(payload)
 	s.mu.Unlock()
 	released := false
 	release := func() {
@@ -620,6 +666,45 @@ func (s *ServerBidiStream) State() BidiState {
 		SendClosed: s.sendClosed,
 		RecvClosed: s.remoteClosed,
 	}
+}
+
+// Snapshot copies server-side diagnostic facts and the shared credit pool
+// without sending or replaying a frame. Unknown segments remain pending.
+func (s *ServerBidiStream) Snapshot() StreamSnapshot {
+	s.mu.Lock()
+	acked := s.acked
+	if s.pendingAck > acked {
+		acked = s.pendingAck
+	}
+	sizes := make(map[uint64]int, len(s.sizes))
+	for seq, size := range s.sizes {
+		sizes[seq] = size
+	}
+	snap := StreamSnapshot{
+		StreamID:      s.id,
+		Method:        s.method,
+		Sent:          s.sent,
+		Acked:         acked,
+		Received:      s.received,
+		SegmentSizes:  sizes,
+		SendClosed:    s.sendClosed,
+		ReceiveClosed: s.remoteClosed,
+	}
+	select {
+	case <-s.connDone:
+		snap.Done = true
+		snap.CloseReason = ErrConnectionClosed
+		snap.Connection.Closed = true
+		snap.Connection.CloseReason = ErrConnectionClosed
+	default:
+		if s.resetClosed {
+			snap.Done = true
+			snap.CloseReason = ErrStreamReset
+		}
+	}
+	snap.Connection.Credits = s.credits.snapshot()
+	s.mu.Unlock()
+	return snap
 }
 
 // markRemoteClosed records a peer half-close observed by the connection

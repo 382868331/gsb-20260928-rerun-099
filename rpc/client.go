@@ -43,6 +43,7 @@ type clientSession struct {
 	nextID      atomic.Uint64
 	mu          sync.Mutex
 	closed      chan struct{}
+	closeReason error
 	closeOnce   sync.Once
 }
 
@@ -421,6 +422,19 @@ func (s *clientSession) remove(id uint64) {
 	s.mu.Unlock()
 }
 
+func (s *clientSession) diagnosticSnapshot() ConnectionSnapshot {
+	s.mu.Lock()
+	reason := s.closeReason
+	s.mu.Unlock()
+	closed := false
+	select {
+	case <-s.closed:
+		closed = true
+	default:
+	}
+	return ConnectionSnapshot{Closed: closed, CloseReason: reason, Credits: s.bidiCredits.snapshot()}
+}
+
 func (s *clientSession) readLoop(maxSize int) {
 	defer s.close(ErrConnectionClosed)
 	for {
@@ -494,6 +508,7 @@ func (s *clientSession) close(err error) {
 		close(s.closed)
 		_ = s.conn.Close()
 		s.mu.Lock()
+		s.closeReason = err
 		for id, call := range s.pending {
 			delete(s.pending, id)
 			call.closeOnce.Do(func() { close(call.done) })

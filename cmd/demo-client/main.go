@@ -42,9 +42,97 @@ func main() {
 		}
 		defer newClient.Close()
 		runReconnectPhase(newClient)
+	case "snapshot":
+		runSnapshotPhase(*addr, *token)
 	default:
 		log.Fatalf("unknown phase %q", *phase)
 	}
+}
+
+func runSnapshotPhase(addr, token string) {
+	client, err := rpc.Dial(context.Background(), rpc.ClientConfig{
+		Address:       addr,
+		StreamCredits: 4,
+		Headers:       map[string]string{"authorization": "Bearer " + token},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	firstSizes := []int{1, 4096, 100000}
+	secondSizes := []int{512, 17, 8192}
+	streams := make([]*rpc.BidiStream, 3)
+	before := make([]rpc.StreamSnapshot, 3)
+	for i := range streams {
+		stream, err := client.BidiStream(context.Background(), "demo.DiagnosticHold", demo.ChatRequest{ID: fmt.Sprintf("diag-%d", i+1)}, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		streams[i] = stream
+		if err := stream.Send(context.Background(), []byte(strings.Repeat("a", firstSizes[i])), nil); err != nil {
+			log.Fatalf("stream %d first send: %v", i+1, err)
+		}
+		before[i] = stream.Snapshot()
+	}
+
+	sendErr := make(chan error, len(streams))
+	for i, stream := range streams {
+		i, stream := i, stream
+		go func() {
+			sendErr <- stream.Send(context.Background(), []byte(strings.Repeat("b", secondSizes[i])), nil)
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	held := make([]rpc.StreamSnapshot, len(streams))
+	for i, stream := range streams {
+		held[i] = stream.Snapshot()
+		printStreamSnapshot("held", held[i])
+	}
+
+	for range streams {
+		if err := <-sendErr; err != nil {
+			log.Fatalf("second send: %v", err)
+		}
+	}
+	for i, stream := range streams {
+		after := stream.Snapshot()
+		diff := rpc.CompareStreamSnapshots(before[i], after)
+		fmt.Printf("snapshot stream_id=%d method=%s newly_confirmed=[%d,%d]\n", diff.StreamID, diff.Method, diff.NewlyConfirmed.Start, diff.NewlyConfirmed.End)
+		printStreamSnapshot("confirmed", after)
+	}
+
+	for i, stream := range streams {
+		go func(i int, stream *rpc.BidiStream) {
+			sendErr <- stream.Send(context.Background(), []byte(strings.Repeat("c", 32*(i+1))), nil)
+		}(i, stream)
+	}
+	time.Sleep(100 * time.Millisecond)
+	_ = client.Close()
+	time.Sleep(50 * time.Millisecond)
+	for i := range streams {
+		if err := <-sendErr; err != nil && !errors.Is(err, rpc.ErrConnectionClosed) {
+			log.Fatalf("third send: %v", err)
+		}
+		printStreamSnapshot("closed", streams[i].Snapshot())
+	}
+}
+
+func printStreamSnapshot(label string, snap rpc.StreamSnapshot) {
+	confirmed := "none"
+	if r, ok := snap.ConfirmedRange(); ok {
+		confirmed = fmt.Sprintf("[%d,%d]", r.Start, r.End)
+	}
+	pending := "none"
+	if r, ok := snap.PendingRange(); ok {
+		pending = fmt.Sprintf("[%d,%d]", r.Start, r.End)
+	}
+	reason := "none"
+	if snap.CloseReason != nil {
+		reason = snap.CloseReason.Error()
+	}
+	fmt.Printf("%s stream_id=%d method=%s sent=%d acked=%d confirmed=%s pending=%s sizes=%v done=%t reason=%q shared_credits=%d/%d available=%d closed=%t\n",
+		label, snap.StreamID, snap.Method, snap.Sent, snap.Acked, confirmed, pending, snap.SegmentSizes, snap.Done, reason,
+		snap.Connection.Credits.Used, snap.Connection.Credits.Limit, snap.Connection.Credits.Available, snap.Connection.Closed)
 }
 
 func runStreamPhase(client *rpc.Client) {

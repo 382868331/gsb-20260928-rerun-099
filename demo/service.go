@@ -135,6 +135,18 @@ func Chat(ctx context.Context, req *ChatRequest, stream *rpc.ServerBidiStream) e
 	return stream.CloseSend(ctx)
 }
 
+func DiagnosticHold(ctx context.Context, _ *ChatRequest, stream *rpc.ServerBidiStream) error {
+	if _, _, err := stream.Recv(ctx); err != nil {
+		return err
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, _, err := stream.Recv(ctx); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 func Status(context.Context, *StatusRequest) (StatusResponse, error) {
 	return StatusResponse{CanceledWatches: CanceledWatches.Load()}, nil
 }

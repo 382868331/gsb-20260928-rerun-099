@@ -137,6 +137,133 @@ func TestBidiParallelStreamsAndCallsShareConnection(t *testing.T) {
 	}
 }
 
+func TestBidiSnapshotsCompareConfirmationsAndSurviveDisconnect(t *testing.T) {
+	const streamCount = 3
+	firstSizes := []int{1, 4096, 100000}
+	secondSizes := []int{512, 17, 8192}
+	thirdSizes := []int{3, 64, 256}
+	firstReceived := make(chan struct{}, streamCount)
+	releaseSecond := make(chan struct{})
+	secondReceived := make(chan struct{}, streamCount)
+	serverSnapshots := make(chan StreamSnapshot, streamCount)
+
+	server := NewServer(ServerConfig{Address: "pipe", MaxHandlers: 16, StreamCredits: 4})
+	server.HandleBidi("snapshot", func(ctx context.Context, _ []byte, _ map[string]string, stream *ServerBidiStream) error {
+		if _, _, err := stream.Recv(ctx); err != nil {
+			return err
+		}
+		firstReceived <- struct{}{}
+		<-releaseSecond
+		if _, _, err := stream.Recv(ctx); err != nil {
+			return err
+		}
+		serverSnapshots <- stream.Snapshot()
+		secondReceived <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	t.Cleanup(func() { _ = server.Close() })
+	client := dialTestClient(t, server, ClientConfig{StreamCredits: 4})
+
+	streams := make([]*BidiStream, streamCount)
+	before := make([]StreamSnapshot, streamCount)
+	for i := range streams {
+		stream, err := client.BidiStream(context.Background(), "snapshot", testPayload{Value: fmt.Sprintf("snapshot-%d", i)}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		streams[i] = stream
+		if err := stream.Send(context.Background(), bidiSegment("snapshot", 1, firstSizes[i]), nil); err != nil {
+			t.Fatalf("stream %d first send: %v", i, err)
+		}
+		<-firstReceived
+		before[i] = stream.Snapshot()
+		if before[i].Sent != 1 || before[i].Acked != 1 || before[i].SegmentSizes[1] != len(bidiSegment("snapshot", 1, firstSizes[i])) {
+			t.Fatalf("stream %d first snapshot: %+v", i, before[i])
+		}
+	}
+
+	sendErr := make(chan error, streamCount*2)
+	for i, stream := range streams {
+		go func(i int, stream *BidiStream) {
+			sendErr <- stream.Send(context.Background(), bidiSegment("snapshot", 2, secondSizes[i]), nil)
+		}(i, stream)
+	}
+	deadline := time.After(time.Second)
+	for {
+		held := streams[0].Snapshot()
+		for _, stream := range streams {
+			held = stream.Snapshot()
+		}
+		if held.Connection.Credits.Used == streamCount && held.Connection.Credits.Available == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			snap := streams[0].Snapshot()
+			t.Fatalf("shared credits = %+v, want used=%d available=1", snap.Connection.Credits, streamCount)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	for i, stream := range streams {
+		held := stream.Snapshot()
+		pending, ok := held.PendingRange()
+		if !ok || pending != (SeqRange{Start: 2, End: 2}) || held.Connection.Credits.Limit != 4 || held.Connection.Credits.Used != streamCount {
+			t.Fatalf("stream %d held snapshot: %+v", i, held)
+		}
+	}
+
+	close(releaseSecond)
+	for i := 0; i < streamCount; i++ {
+		if err := <-sendErr; err != nil {
+			t.Fatalf("second send: %v", err)
+		}
+		<-secondReceived
+	}
+	for i, stream := range streams {
+		after := stream.Snapshot()
+		diff := CompareStreamSnapshots(before[i], after)
+		if !diff.HasChange || diff.NewlyConfirmed != (SeqRange{Start: 2, End: 2}) || after.Acked != 2 {
+			t.Fatalf("stream %d confirmation diff: %+v", i, diff)
+		}
+		if after.SegmentSizes[2] != len(bidiSegment("snapshot", 2, secondSizes[i])) {
+			t.Fatalf("stream %d second size: %+v", i, after.SegmentSizes)
+		}
+	}
+	for i := 0; i < streamCount; i++ {
+		serverSnap := <-serverSnapshots
+		if serverSnap.Method != "snapshot" || serverSnap.StreamID == 0 || serverSnap.Received != 2 {
+			t.Fatalf("server snapshot not correlated: %+v", serverSnap)
+		}
+	}
+
+	for i, stream := range streams {
+		go func(i int, stream *BidiStream) {
+			sendErr <- stream.Send(context.Background(), bidiSegment("snapshot", 3, thirdSizes[i]), nil)
+		}(i, stream)
+	}
+	time.Sleep(50 * time.Millisecond)
+	old := client.session
+	old.close(ErrConnectionClosed)
+	for i, stream := range streams {
+		if err := <-sendErr; err != nil && !errors.Is(err, ErrConnectionClosed) {
+			t.Fatalf("third send: %v", err)
+		}
+		finalSnap := stream.Snapshot()
+		if !finalSnap.Done || !errors.Is(finalSnap.CloseReason, ErrConnectionClosed) || !finalSnap.Connection.Closed {
+			t.Fatalf("stream %d final close snapshot: %+v", i, finalSnap)
+		}
+		pending, ok := finalSnap.PendingRange()
+		if !ok || pending != (SeqRange{Start: 3, End: 3}) || finalSnap.Acked != 2 || finalSnap.Sent != 3 {
+			t.Fatalf("stream %d final ranges: %+v", i, finalSnap)
+		}
+		if CompareStreamSnapshots(before[i], finalSnap).NewlyConfirmed != (SeqRange{Start: 2, End: 2}) {
+			t.Fatalf("final snapshot lost previously confirmed range: %+v", finalSnap)
+		}
+	}
+}
+
 func TestBidiHalfCloseKeepsOtherDirectionAlive(t *testing.T) {
 	server := newBidiTestServer(t)
 	serverState := make(chan BidiState, 1)
