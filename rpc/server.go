@@ -23,6 +23,7 @@ type ServerConfig struct {
 	MaxFrameSize  int
 	WriteQueue    int
 	MaxHandlers   int
+	StreamBuffer  int64
 	Codec         PayloadCodec
 	Authenticate  Authenticator
 	HeaderTimeout time.Duration
@@ -51,6 +52,9 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	if cfg.MaxHandlers <= 0 {
 		cfg.MaxHandlers = 1024
+	}
+	if cfg.StreamBuffer <= 0 {
+		cfg.StreamBuffer = defaultStreamBuffer
 	}
 	if cfg.Codec == nil {
 		cfg.Codec = JSONCodec{}
@@ -197,10 +201,41 @@ func (s *Server) serveConn(conn net.Conn) {
 	writeCh := make(chan serverWriteReq)
 	requests := make(map[uint64]context.CancelFunc)
 	streamAcks := make(map[uint64]chan *Envelope)
+	bidiAcks := make(map[uint64]*ServerBidiStream)
 	bidiData := make(map[uint64]chan *Envelope)
 	var requestsMu sync.Mutex
 	semaphore := make(chan struct{}, s.cfg.MaxHandlers)
 	var active sync.WaitGroup
+	buf := newBufferCredit(s.cfg.StreamBuffer)
+
+	// writeEnv hands a frame to the connection writer. If the caller's
+	// context is canceled while the frame is already queued, it still
+	// waits for the real write result (bounded by the writer deadline):
+	// a frame that reached the peer must be reported as sent, never
+	// silently misaccounted as canceled.
+	writeEnv := func(outCtx context.Context, out *Envelope) error {
+		req := serverWriteReq{env: out, errCh: make(chan error, 1)}
+		select {
+		case writeCh <- req:
+		case <-outCtx.Done():
+			return outCtx.Err()
+		case <-connDone:
+			return ErrConnectionClosed
+		}
+		select {
+		case err := <-req.errCh:
+			return err
+		case <-outCtx.Done():
+			select {
+			case err := <-req.errCh:
+				return err
+			case <-connDone:
+				return ErrConnectionClosed
+			}
+		case <-connDone:
+			return ErrConnectionClosed
+		}
+	}
 
 	var writeWG sync.WaitGroup
 	writeWG.Add(1)
@@ -273,9 +308,12 @@ func (s *Server) serveConn(conn net.Conn) {
 			}
 		case TypeAck:
 			requestsMu.Lock()
+			bidi := bidiAcks[env.ID]
 			ack := streamAcks[env.ID]
 			requestsMu.Unlock()
-			if ack != nil {
+			if bidi != nil {
+				bidi.onAck(env.Seq)
+			} else if ack != nil {
 				select {
 				case ack <- env:
 				default:
@@ -315,13 +353,25 @@ func (s *Server) serveConn(conn net.Conn) {
 			requests[env.ID] = cancel
 			var ackCh chan *Envelope
 			var dataCh chan *Envelope
-			if env.Flags&FlagStream != 0 || env.Flags&FlagBidi != 0 {
+			var bidiStream *ServerBidiStream
+			if env.Flags&FlagStream != 0 {
 				ackCh = make(chan *Envelope, 1)
 				streamAcks[env.ID] = ackCh
 			}
 			if env.Flags&FlagBidi != 0 {
 				dataCh = make(chan *Envelope, 2)
 				bidiData[env.ID] = dataCh
+				bidiStream = &ServerBidiStream{
+					id:         env.ID,
+					serializer: s.cfg.Codec.ID(),
+					write:      writeEnv,
+					ackCh:      make(chan struct{}, 1),
+					dataCh:     dataCh,
+					connDone:   connDone,
+					buf:        buf,
+					pending:    make(map[uint64]int64),
+				}
+				bidiAcks[env.ID] = bidiStream
 			}
 			requestsMu.Unlock()
 			streamCall := env.Flags&FlagStream != 0
@@ -335,37 +385,12 @@ func (s *Server) serveConn(conn net.Conn) {
 					requestsMu.Lock()
 					delete(requests, env.ID)
 					delete(streamAcks, env.ID)
+					delete(bidiAcks, env.ID)
 					delete(bidiData, env.ID)
 					requestsMu.Unlock()
 				}()
-				writeEnv := func(outCtx context.Context, out *Envelope) error {
-					req := serverWriteReq{env: out, errCh: make(chan error, 1)}
-					select {
-					case writeCh <- req:
-						select {
-						case err := <-req.errCh:
-							return err
-						case <-outCtx.Done():
-							return outCtx.Err()
-						case <-connDone:
-							return ErrConnectionClosed
-						}
-					case <-outCtx.Done():
-						return outCtx.Err()
-					case <-connDone:
-						return ErrConnectionClosed
-					}
-				}
 				if bidiCall {
-					stream := &ServerBidiStream{
-						id:         env.ID,
-						serializer: s.cfg.Codec.ID(),
-						write:      writeEnv,
-						ackCh:      ackCh,
-						dataCh:     dataCh,
-						connDone:   connDone,
-					}
-					callErr := s.dispatchBidiSafe(ctx, env, stream)
+					callErr := s.dispatchBidiSafe(ctx, env, bidiStream)
 					if ctx.Err() != nil {
 						return
 					}
@@ -373,10 +398,13 @@ func (s *Server) serveConn(conn net.Conn) {
 						_ = writeEnv(context.Background(), &Envelope{Type: TypeError, ID: env.ID, Error: callErr.Error(), Serializer: s.cfg.Codec.ID()})
 						return
 					}
-					if !stream.SendClosed() {
-						_ = stream.CloseSend(context.Background())
+					// Account for anything the peer already sent but the
+					// handler never consumed, including its half-close.
+					bidiStream.observeBuffered()
+					if !bidiStream.SendClosed() {
+						_ = bidiStream.CloseSend(context.Background())
 					}
-					if !stream.RemoteClosed() {
+					if !bidiStream.RemoteClosed() {
 						// The handler returned while the peer may still send:
 						// reset the inbound direction so the peer is never left
 						// waiting silently. The outbound direction already ended

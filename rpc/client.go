@@ -15,6 +15,7 @@ type ClientConfig struct {
 	MaxFrameSize int
 	MaxPending   int
 	WriteQueue   int
+	StreamBuffer int64
 	Headers      map[string]string
 	Codec        PayloadCodec
 }
@@ -31,12 +32,21 @@ type CallResult struct {
 	Headers map[string]string
 }
 
+// BufferState reports the connection-wide stream buffer credit: how many
+// unacknowledged stream payload bytes are currently in flight (Used) and
+// the configured cap (Limit).
+type BufferState struct {
+	Used  int64
+	Limit int64
+}
+
 type clientSession struct {
 	cfg       ClientConfig
 	conn      net.Conn
 	reader    *bufio.Reader
 	writeCh   chan []byte
 	cancelCh  chan []byte
+	buf       *bufferCredit
 	pending   map[uint64]*pendingCall
 	nextID    atomic.Uint64
 	mu        sync.Mutex
@@ -91,10 +101,28 @@ func withDefaults(cfg ClientConfig) ClientConfig {
 	if cfg.WriteQueue <= 0 {
 		cfg.WriteQueue = 1024
 	}
+	if cfg.StreamBuffer <= 0 {
+		cfg.StreamBuffer = defaultStreamBuffer
+	}
 	if cfg.Codec == nil {
 		cfg.Codec = JSONCodec{}
 	}
 	return cfg
+}
+
+// BufferState returns the current connection's shared stream buffer usage.
+// After the connection closes the counters remain inspectable: Used reports
+// the bytes that were still unacknowledged when the session ended (the
+// credit is then released for the next session).
+func (c *Client) BufferState() BufferState {
+	c.mu.Lock()
+	s := c.session
+	c.mu.Unlock()
+	if s == nil {
+		return BufferState{Limit: c.cfg.StreamBuffer}
+	}
+	used, limit := s.buf.state()
+	return BufferState{Used: used, Limit: limit}
 }
 
 func (c *Client) Close() error {
@@ -265,6 +293,7 @@ func (c *Client) newSession(conn net.Conn) *clientSession {
 		reader:   bufio.NewReader(conn),
 		writeCh:  make(chan []byte, c.cfg.WriteQueue),
 		cancelCh: make(chan []byte, 8),
+		buf:      newBufferCredit(c.cfg.StreamBuffer),
 		pending:  make(map[uint64]*pendingCall),
 		closed:   make(chan struct{}),
 	}
@@ -487,6 +516,7 @@ func (s *clientSession) close(err error) {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		_ = s.conn.Close()
+		s.buf.reset()
 		s.mu.Lock()
 		for id, call := range s.pending {
 			delete(s.pending, id)
