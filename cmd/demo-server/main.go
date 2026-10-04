@@ -26,6 +26,7 @@ func main() {
 	rpc.HandleStream(server, "demo.Numbers", demo.Numbers)
 	rpc.HandleStream(server, "demo.Watch", demo.Watch)
 	rpc.HandleBidi(server, "demo.Chat", demo.Chat)
+	rpc.HandleBidi(server, "demo.SnapshotSink", demo.SnapshotSink)
 
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {

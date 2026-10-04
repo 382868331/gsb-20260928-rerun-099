@@ -8,6 +8,9 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"weak"
 )
 
 type ClientConfig struct {
@@ -33,17 +36,21 @@ type CallResult struct {
 }
 
 type clientSession struct {
-	cfg         ClientConfig
-	conn        net.Conn
-	reader      *bufio.Reader
-	writeCh     chan []byte
-	cancelCh    chan []byte
-	pending     map[uint64]*pendingCall
-	bidiCredits *creditPool
-	nextID      atomic.Uint64
-	mu          sync.Mutex
-	closed      chan struct{}
-	closeOnce   sync.Once
+	cfg            ClientConfig
+	conn           net.Conn
+	reader         *bufio.Reader
+	writeCh        chan []byte
+	cancelCh       chan []byte
+	pending        map[uint64]*pendingCall
+	bidiCredits    *creditPool
+	bidiStreams    map[uint64]weak.Pointer[BidiStream]
+	streamsMu      sync.Mutex
+	nextID         atomic.Uint64
+	mu             sync.Mutex
+	closed         chan struct{}
+	closeOnce      sync.Once
+	closedAt       time.Time
+	creditsAtClose int
 }
 
 type pendingCall struct {
@@ -110,7 +117,6 @@ func (c *Client) Close() error {
 	}
 	c.closed = true
 	s := c.session
-	c.session = nil
 	c.mu.Unlock()
 	if s != nil {
 		s.close(ErrConnectionClosed)
@@ -272,6 +278,7 @@ func (c *Client) newSession(conn net.Conn) *clientSession {
 		cancelCh:    make(chan []byte, 8),
 		pending:     make(map[uint64]*pendingCall),
 		bidiCredits: newCreditPool(c.cfg.StreamCredits),
+		bidiStreams: make(map[uint64]weak.Pointer[BidiStream]),
 		closed:      make(chan struct{}),
 	}
 	s.nextID.Store(fastrandID())
@@ -308,7 +315,14 @@ func (s *clientSession) begin(ctx context.Context, env *Envelope, cfg ClientConf
 }
 
 func (s *clientSession) beginBidi(env *Envelope, cfg ClientConfig, bidi *BidiStream) (*pendingCall, error) {
-	return s.beginCall(env, cfg, false, bidi)
+	call, err := s.beginCall(env, cfg, false, bidi)
+	if err != nil {
+		return nil, err
+	}
+	bidi.session = s
+	bidi.call = call
+	s.registerBidi(bidi)
+	return call, nil
 }
 
 func (s *clientSession) beginCall(env *Envelope, cfg ClientConfig, stream bool, bidi *BidiStream) (*pendingCall, error) {
@@ -491,6 +505,8 @@ func (s *clientSession) writeLoop(maxSize int) {
 
 func (s *clientSession) close(err error) {
 	s.closeOnce.Do(func() {
+		s.closedAt = time.Now()
+		s.creditsAtClose = s.bidiCredits.available()
 		close(s.closed)
 		_ = s.conn.Close()
 		s.mu.Lock()

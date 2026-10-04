@@ -28,6 +28,20 @@ if [[ "$ready" != 1 ]]; then
 fi
 go run ./cmd/demo-client -addr "$addr" -token "$token" -phase stream
 
+# Snapshot phase: the client saves snapshots, then the server is killed
+# while the client waits so the post-close snapshot records the shared
+# credit pool, finish reason and confirmed/undetermined ranges.
+snapshot_dir="$tmp_dir/snapshots"
+mkdir -p "$snapshot_dir"
+go run ./cmd/demo-client -addr "$addr" -token "$token" -phase snapshot -outdir "$snapshot_dir" &
+client_pid=$!
+sleep 3
+kill -TERM "$server_pid"
+wait "$server_pid" 2>/dev/null || true
+wait "$client_pid" || true
+echo "saved snapshots:"
+ls -1 "$snapshot_dir"/snapshot-*.json
+
 kill -TERM "$server_pid"
 wait "$server_pid" 2>/dev/null || true
 go run ./cmd/demo-server -addr "$addr" -token "$token" >"$server_log" 2>&1 &

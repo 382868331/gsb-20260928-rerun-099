@@ -64,6 +64,18 @@ type StatusResponse struct {
 	CanceledWatches int64 `json:"canceled_watches"`
 }
 
+// SnapshotSink accepts one segment per stream (so it is confirmed) and
+// then never drains further data: subsequent segments stay in the
+// unacknowledged (Acked, Sent] range, making connection-close diagnostics
+// show both confirmed and undetermined ranges.
+func SnapshotSink(ctx context.Context, req *ChatRequest, stream *rpc.ServerBidiStream) error {
+	if _, _, err := stream.Recv(ctx); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 var CanceledJobs atomic.Int64
 var CanceledWatches atomic.Int64
 

@@ -119,12 +119,10 @@ func (c *Client) BidiStream(ctx context.Context, method string, arg any, headers
 		return nil, err
 	}
 	stream := &BidiStream{ackCh: make(chan uint64, 4)}
-	call, err := s.beginBidi(env, c.cfg, stream)
+	_, err = s.beginBidi(env, c.cfg, stream)
 	if err != nil {
 		return nil, err
 	}
-	stream.session = s
-	stream.call = call
 	return stream, nil
 }
 
@@ -299,6 +297,13 @@ func (s *BidiStream) Cancel() {
 	s.session.cancel(s.call.id, s.call.method, s.session.cfg)
 	s.fail(context.Canceled)
 }
+
+// StreamID reports this stream's session-local envelope ID, so saved
+// diagnostic snapshots can be correlated back to the real stream.
+func (s *BidiStream) StreamID() uint64 { return s.call.id }
+
+// Method reports the RPC method this stream was opened on.
+func (s *BidiStream) Method() string { return s.call.method }
 
 func (s *BidiStream) State() BidiState {
 	s.mu.Lock()

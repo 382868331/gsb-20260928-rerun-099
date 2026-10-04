@@ -58,6 +58,13 @@ func newBidiTestServer(t *testing.T) *Server {
 	server.HandleBidi("echo", func(ctx context.Context, _ []byte, _ map[string]string, stream *ServerBidiStream) error {
 		return echoBidiHandler(ctx, stream)
 	})
+	server.HandleBidi("sink-once", func(ctx context.Context, _ []byte, _ map[string]string, stream *ServerBidiStream) error {
+		if _, _, err := stream.Recv(ctx); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	})
 	server.Handle("test", unaryTestHandler)
 	t.Cleanup(func() { _ = server.Close() })
 	return server

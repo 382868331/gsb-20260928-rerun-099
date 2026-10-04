@@ -29,6 +29,7 @@
 - `CloseSend` 半关闭只结束本方向：对端 `Recv` 在消费完已发数据后得到 `io.EOF`，反方向及其他流、普通请求照常继续；半关闭后 `Send` 返回 `ErrStreamClosed`。双向同时半关闭时双方最终状态一致，半关闭尾段在已经报告正常结束后不会再被重置丢失。
 - `Cancel` 只取消目标流：对端 handler 的 context 被取消，本端后续操作为 `context.Canceled`；取消帧不排在受流控的数据帧之后，且绝不扩散到同一连接上的其他流或普通请求。与尾段 ACK 交错时，已经被对端确认的分段仍正常完成。服务端 handler 未读完入方向数据就返回时，框架先发半关闭再发重置，仍开放的对端发送方向得到 `ErrStreamReset`，不会无声悬挂；对端若已经半关闭，则不再误发重置。
 - 连接中断时，流上的 `Send`/`Recv` 返回 `ErrConnectionClosed`；`State()` 如实保留 `Acked`（对端已确认）与 `Sent>Acked`（已发出但结果不能确定）。普通请求断线时同样以 `ErrConnectionClosed` 失败，结果视为不能确定，框架绝不静默重放可能有副作用的请求；只有新调用才会走新会话。
+- `BidiStream.Snapshot()` / `Client.Snapshot()` 返回可保存的纯数据诊断快照（`ConnectionSnapshot.SaveJSON`），包含每条流的方法名、真实流 ID、已确认区间 `[1,Acked]`、待确认区间 `(Acked,Sent]`、已接收段数、收尾原因（`eof`/`canceled`/`reset`/`connection_closed`/`error`）以及当时**整条连接共享额度池**的总额度与可用/占用额度。连接关闭后仍可通过流对象获取快照；快照只记录诊断事实，不发送任何帧、不触发请求重放，也不会把未知结果改成成功。`CompareSnapshots(old, new)` 按真实流 ID 比较两次快照，给出每条流新得到确认的序号范围 `[NewlyConfirmedLo, NewlyConfirmedHi]`；断连后待确认段仍保持“结果未定”，不会出现在已确认 diff 中。
 - 坏帧或超大帧只关闭对应连接；非法大小、未知版本等在进入业务处理前被拒绝。
 - `MaxPending` 限制等待调用数量，`WriteQueue` 限制连接写队列，`MaxHandlers` 限制服务端并发 handler，`StreamCredits` 限制单条连接上双向流在途分段的共享总额度。
 - 鉴权通过请求头部注入，不进入业务请求结构；压缩后续可作为负载编码或内容编码层扩展。
@@ -74,3 +75,45 @@ go test -race ./...
 测试覆盖并发乱序响应、流式顺序、共享连接关联、慢读取 ACK 背压、真实上下文取消、超时、断连结束调用、重连、旧会话响应隔离、坏帧隔离、消息大小限制和等待队列限制。
 
 双向流测试覆盖：多条流与普通请求并行且内容/序号互不串扰、不同大小分段（1B 到 100KB）的顺序与内容核对、半关闭后反方向继续工作且双方最终状态一致、交错取消只影响目标流、慢接收方窗口为 1 且不饿死短请求、断连后已确认/不能确定分段的精确上报、普通请求不重放、服务端提前返回时的入方向重置。
+
+## 流诊断快照示例
+
+一键脚本的 snapshot 阶段会在真实 TCP 上开启 3 条并发双向流（16B、4KB、100KB 不同分段），分别在“未发送”“首批已确认”“连接被杀死后”保存三份 JSON 快照，并打印比较结果：
+
+```bash
+./demo/run.sh
+# 快照文件位于脚本输出的临时目录：snapshot-before.json / snapshot-mid.json / snapshot-after.json
+```
+
+前两份快照的比较显示每条真实流（按 `stream_id` 关联）的 `[1,1]` 区间得到确认；断连后的快照中各流 `finish_reason=connection_closed`，已确认区间仍为 `[1,1]`，第二段留在 `(1,2]` 待确认区间（结果未定，不重放、不记为成功），同时记录断连瞬间的共享额度：
+
+```json
+{
+  "closed": true,
+  "total_credits": 32,
+  "available_credits": 29,
+  "inflight_credits": 3,
+  "streams": [
+    {
+      "stream_id": 12345,
+      "method": "demo.SnapshotSink",
+      "sent": 2,
+      "acked": 1,
+      "pending_lo": 2,
+      "pending_hi": 2,
+      "received": 0,
+      "done": true,
+      "finish_reason": "connection_closed",
+      "err": "lrpc: connection closed"
+    }
+  ]
+}
+```
+
+也可以手动运行（需要由外部在客户端等待期间停止服务端）：
+
+```bash
+go run ./cmd/demo-server -addr 127.0.0.1:19092 -token local-demo-token
+go run ./cmd/demo-client -addr 127.0.0.1:19092 -token local-demo-token -phase snapshot -outdir /tmp/lrpc-snaps
+```
+
