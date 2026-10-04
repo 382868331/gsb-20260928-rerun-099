@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -23,6 +22,7 @@ type ServerConfig struct {
 	MaxFrameSize  int
 	WriteQueue    int
 	MaxHandlers   int
+	StreamCredits int
 	Codec         PayloadCodec
 	Authenticate  Authenticator
 	HeaderTimeout time.Duration
@@ -51,6 +51,9 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	if cfg.MaxHandlers <= 0 {
 		cfg.MaxHandlers = 1024
+	}
+	if cfg.StreamCredits <= 0 {
+		cfg.StreamCredits = DefaultStreamCredits
 	}
 	if cfg.Codec == nil {
 		cfg.Codec = JSONCodec{}
@@ -197,10 +200,14 @@ func (s *Server) serveConn(conn net.Conn) {
 	writeCh := make(chan serverWriteReq)
 	requests := make(map[uint64]context.CancelFunc)
 	streamAcks := make(map[uint64]chan *Envelope)
-	bidiData := make(map[uint64]chan *Envelope)
+	bidiStreams := make(map[uint64]*ServerBidiStream)
 	var requestsMu sync.Mutex
 	semaphore := make(chan struct{}, s.cfg.MaxHandlers)
 	var active sync.WaitGroup
+	// Shared connection grant pool for segments the server sends on bidi
+	// streams (server -> client). A single slow stream consumes one grant;
+	// the rest remain available to other streams and short work.
+	credits := newCreditPool(s.cfg.StreamCredits)
 
 	var writeWG sync.WaitGroup
 	writeWG.Add(1)
@@ -232,22 +239,24 @@ func (s *Server) serveConn(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	readErr := error(nil)
 	shutdownRead := false
+	// Block on reads; server shutdown closes the active connections, which
+	// unblocks ReadFrame. Polling deadlines used to insert latency between
+	// back-to-back frames, letting a later cancel overtake an earlier ack.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-s.closed:
+			_ = conn.Close()
+		case <-stopWatch:
+		}
+	}()
 	for {
 		if shutdownRead {
 			break
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 		frame, err := ReadFrame(reader, s.cfg.MaxFrameSize, nil)
-		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				select {
-				case <-s.closed:
-					return
-				default:
-					continue
-				}
-			}
 			readErr = err
 			break
 		}
@@ -259,32 +268,58 @@ func (s *Server) serveConn(conn net.Conn) {
 		switch env.Type {
 		case TypeStream:
 			requestsMu.Lock()
-			dataCh := bidiData[env.ID]
+			stream := bidiStreams[env.ID]
 			requestsMu.Unlock()
-			if dataCh == nil {
+			if stream == nil {
 				s.sendControl(writeCh, connDone, &Envelope{Type: TypeCancel, ID: env.ID, Serializer: s.cfg.Codec.ID()})
 				continue
 			}
-			select {
-			case dataCh <- env:
-			default:
-				readErr = ErrBadFrame
-				shutdownRead = true
+			if env.Flags&FlagEnd != 0 {
+				// A half-close ends only this direction; record it even
+				// if the handler has not drained its inbox, so handler
+				// completion does not wrongly reset a cleanly finished
+				// peer or lose the already-buffered tail.
+				stream.markRemoteClosed(env)
+				continue
 			}
+			select {
+			case stream.dataCh <- env:
+			case <-connDone:
+				return
+			}
+			// Delivery applies backpressure in order instead of killing
+			// the connection: with a one-segment window the sender cannot
+			// have more data behind this frame, so the stall is bounded
+			// to this stream only.
 		case TypeAck:
 			requestsMu.Lock()
 			ack := streamAcks[env.ID]
+			bidi := bidiStreams[env.ID]
 			requestsMu.Unlock()
+			if bidi != nil {
+				bidi.deliverAck(env)
+				continue
+			}
 			if ack != nil {
 				select {
 				case ack <- env:
-				default:
+				case <-connDone:
 				}
 			}
 		case TypeCancel:
 			requestsMu.Lock()
 			cancel := requests[env.ID]
+			stream := bidiStreams[env.ID]
 			requestsMu.Unlock()
+			if stream != nil {
+				// Route cancellation to the affected stream only: wake its
+				// handler, but never tear down or fail unrelated streams
+				// or ordinary calls. An ack preceding the cancel in frame
+				// order was already recorded, so a confirmed tail segment
+				// still completes in Send.
+				stream.postReset()
+				continue
+			}
 			if cancel != nil {
 				cancel()
 			}
@@ -314,14 +349,22 @@ func (s *Server) serveConn(conn net.Conn) {
 			requestsMu.Lock()
 			requests[env.ID] = cancel
 			var ackCh chan *Envelope
-			var dataCh chan *Envelope
+			var bidiStream *ServerBidiStream
 			if env.Flags&FlagStream != 0 || env.Flags&FlagBidi != 0 {
-				ackCh = make(chan *Envelope, 1)
+				ackCh = make(chan *Envelope, 2)
 				streamAcks[env.ID] = ackCh
 			}
 			if env.Flags&FlagBidi != 0 {
-				dataCh = make(chan *Envelope, 2)
-				bidiData[env.ID] = dataCh
+				bidiStream = &ServerBidiStream{
+					id:         env.ID,
+					serializer: s.cfg.Codec.ID(),
+					ackCh:      ackCh,
+					dataCh:     make(chan *Envelope, 2),
+					resetCh:    make(chan struct{}),
+					connDone:   connDone,
+					credits:    credits,
+				}
+				bidiStreams[env.ID] = bidiStream
 			}
 			requestsMu.Unlock()
 			streamCall := env.Flags&FlagStream != 0
@@ -335,18 +378,21 @@ func (s *Server) serveConn(conn net.Conn) {
 					requestsMu.Lock()
 					delete(requests, env.ID)
 					delete(streamAcks, env.ID)
-					delete(bidiData, env.ID)
+					delete(bidiStreams, env.ID)
 					requestsMu.Unlock()
 				}()
 				writeEnv := func(outCtx context.Context, out *Envelope) error {
 					req := serverWriteReq{env: out, errCh: make(chan error, 1)}
 					select {
 					case writeCh <- req:
+						// Once the frame is handed to the writer the actual
+						// write result wins over cancellation: the writer
+						// applies its own bounded deadline, and reporting an
+						// error for a frame that was in fact sent would lose
+						// the tail and mis-account confirmed segments.
 						select {
 						case err := <-req.errCh:
 							return err
-						case <-outCtx.Done():
-							return outCtx.Err()
 						case <-connDone:
 							return ErrConnectionClosed
 						}
@@ -357,14 +403,9 @@ func (s *Server) serveConn(conn net.Conn) {
 					}
 				}
 				if bidiCall {
-					stream := &ServerBidiStream{
-						id:         env.ID,
-						serializer: s.cfg.Codec.ID(),
-						write:      writeEnv,
-						ackCh:      ackCh,
-						dataCh:     dataCh,
-						connDone:   connDone,
-					}
+					stream := bidiStream
+					stream.write = writeEnv
+					stream.cancelCtx = cancel
 					callErr := s.dispatchBidiSafe(ctx, env, stream)
 					if ctx.Err() != nil {
 						return

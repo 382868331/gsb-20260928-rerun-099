@@ -11,12 +11,13 @@ import (
 )
 
 type ClientConfig struct {
-	Address      string
-	MaxFrameSize int
-	MaxPending   int
-	WriteQueue   int
-	Headers      map[string]string
-	Codec        PayloadCodec
+	Address       string
+	MaxFrameSize  int
+	MaxPending    int
+	WriteQueue    int
+	StreamCredits int
+	Headers       map[string]string
+	Codec         PayloadCodec
 }
 
 type Client struct {
@@ -32,16 +33,17 @@ type CallResult struct {
 }
 
 type clientSession struct {
-	cfg       ClientConfig
-	conn      net.Conn
-	reader    *bufio.Reader
-	writeCh   chan []byte
-	cancelCh  chan []byte
-	pending   map[uint64]*pendingCall
-	nextID    atomic.Uint64
-	mu        sync.Mutex
-	closed    chan struct{}
-	closeOnce sync.Once
+	cfg         ClientConfig
+	conn        net.Conn
+	reader      *bufio.Reader
+	writeCh     chan []byte
+	cancelCh    chan []byte
+	pending     map[uint64]*pendingCall
+	bidiCredits *creditPool
+	nextID      atomic.Uint64
+	mu          sync.Mutex
+	closed      chan struct{}
+	closeOnce   sync.Once
 }
 
 type pendingCall struct {
@@ -90,6 +92,9 @@ func withDefaults(cfg ClientConfig) ClientConfig {
 	}
 	if cfg.WriteQueue <= 0 {
 		cfg.WriteQueue = 1024
+	}
+	if cfg.StreamCredits <= 0 {
+		cfg.StreamCredits = DefaultStreamCredits
 	}
 	if cfg.Codec == nil {
 		cfg.Codec = JSONCodec{}
@@ -260,13 +265,14 @@ func (c *Client) connectLocked(ctx context.Context) (*clientSession, error) {
 
 func (c *Client) newSession(conn net.Conn) *clientSession {
 	s := &clientSession{
-		cfg:      c.cfg,
-		conn:     conn,
-		reader:   bufio.NewReader(conn),
-		writeCh:  make(chan []byte, c.cfg.WriteQueue),
-		cancelCh: make(chan []byte, 8),
-		pending:  make(map[uint64]*pendingCall),
-		closed:   make(chan struct{}),
+		cfg:         c.cfg,
+		conn:        conn,
+		reader:      bufio.NewReader(conn),
+		writeCh:     make(chan []byte, c.cfg.WriteQueue),
+		cancelCh:    make(chan []byte, 8),
+		pending:     make(map[uint64]*pendingCall),
+		bidiCredits: newCreditPool(c.cfg.StreamCredits),
+		closed:      make(chan struct{}),
 	}
 	s.nextID.Store(fastrandID())
 	go s.writeLoop(c.cfg.MaxFrameSize)

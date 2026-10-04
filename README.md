@@ -24,12 +24,13 @@
 - 主动取消使用独立高优先级取消帧，不排在被流控的普通写消息之后；连接断开会取消该连接上的服务端 context，客户端等待同时结束。
 - 流式正常结束返回 `io.EOF`；取消返回 `context.Canceled`，连接错误返回 `ErrConnectionClosed`。
 - 双向流（`Client.BidiStream` / `Server.HandleBidi`）与普通请求、单向流共享同一连接，互不影响。
-- 双向流每个方向独立编号（从 1 开始）并逐段 ACK：发送方在收到上一段 ACK 前不会发出下一段，因此慢接收方只阻塞自己那条流，每条流每个方向最多 1 段未确认数据，内存有界，短请求不会被饿死。
-- `CloseSend` 半关闭只结束本方向：对端 `Recv` 在消费完已发数据后得到 `io.EOF`，反方向及其他流、普通请求照常继续；半关闭后 `Send` 返回 `ErrStreamClosed`。
-- `Cancel` 取消整条流：对端 handler 的 context 被取消，本端后续操作为 `context.Canceled`；服务端 handler 未读完入方向数据就返回时，框架先发半关闭再发重置，对端发送方向得到 `ErrStreamReset`，不会无声悬挂。
-- 连接中断时，流上的 `Send`/`Recv` 返回 `ErrConnectionClosed`；`State()` 明确报告 `Acked`（对端已确认的分段）与 `Sent`（已发出但结果不能确定的分段）。普通请求断线时同样以 `ErrConnectionClosed` 失败，结果视为不能确定，框架绝不静默重放可能有副作用的请求；只有新调用才会走新会话。
+- 双向流每个方向独立编号（从 1 开始）并逐段 ACK：发送方在收到上一段 ACK 前不会发出下一段，每条流每个方向最多 1 段未确认数据。`StreamCredits`（默认 32）是**整条连接共享**的缓冲额度池：所有流的在途段合计有界，慢流每条只占用 1 个额度，已确认段立即释放额度供其他流、短请求以及取消/结束通知继续使用，大流无法独占额度。
+- `State()` 给出每条流的确定范围：`[1, Acked]` 已确认、`(Acked, Sent]` 已发出但结果未定（`Inflight()` 返回其数量），`Received` 为已交给本端应用的段数；连接关闭后这些计数仍然有效，不会被统一标成成功或取消。
+- `CloseSend` 半关闭只结束本方向：对端 `Recv` 在消费完已发数据后得到 `io.EOF`，反方向及其他流、普通请求照常继续；半关闭后 `Send` 返回 `ErrStreamClosed`。双向同时半关闭时双方最终状态一致，半关闭尾段在已经报告正常结束后不会再被重置丢失。
+- `Cancel` 只取消目标流：对端 handler 的 context 被取消，本端后续操作为 `context.Canceled`；取消帧不排在受流控的数据帧之后，且绝不扩散到同一连接上的其他流或普通请求。与尾段 ACK 交错时，已经被对端确认的分段仍正常完成。服务端 handler 未读完入方向数据就返回时，框架先发半关闭再发重置，仍开放的对端发送方向得到 `ErrStreamReset`，不会无声悬挂；对端若已经半关闭，则不再误发重置。
+- 连接中断时，流上的 `Send`/`Recv` 返回 `ErrConnectionClosed`；`State()` 如实保留 `Acked`（对端已确认）与 `Sent>Acked`（已发出但结果不能确定）。普通请求断线时同样以 `ErrConnectionClosed` 失败，结果视为不能确定，框架绝不静默重放可能有副作用的请求；只有新调用才会走新会话。
 - 坏帧或超大帧只关闭对应连接；非法大小、未知版本等在进入业务处理前被拒绝。
-- `MaxPending` 限制等待调用数量，`WriteQueue` 限制连接写队列，`MaxHandlers` 限制服务端并发 handler。
+- `MaxPending` 限制等待调用数量，`WriteQueue` 限制连接写队列，`MaxHandlers` 限制服务端并发 handler，`StreamCredits` 限制单条连接上双向流在途分段的共享总额度。
 - 鉴权通过请求头部注入，不进入业务请求结构；压缩后续可作为负载编码或内容编码层扩展。
 
 ## 运行本机演示
