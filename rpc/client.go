@@ -432,7 +432,7 @@ func (s *clientSession) diagnosticSnapshot() ConnectionSnapshot {
 		closed = true
 	default:
 	}
-	return ConnectionSnapshot{Closed: closed, CloseReason: reason, Credits: s.bidiCredits.snapshot()}
+	return ConnectionSnapshot{Closed: closed, CloseReason: reason, ReasonKind: ClassifyCloseReason(reason), Credits: s.bidiCredits.snapshot()}
 }
 
 func (s *clientSession) readLoop(maxSize int) {

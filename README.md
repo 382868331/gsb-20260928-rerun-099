@@ -27,6 +27,7 @@
 - 双向流每个方向独立编号（从 1 开始）并逐段 ACK：发送方在收到上一段 ACK 前不会发出下一段，每条流每个方向最多 1 段未确认数据。`StreamCredits`（默认 32）是**整条连接共享**的缓冲额度池：所有流的在途段合计有界，慢流每条只占用 1 个额度，已确认段立即释放额度供其他流、短请求以及取消/结束通知继续使用，大流无法独占额度。
 - `State()` 给出每条流的确定范围：`[1, Acked]` 已确认、`(Acked, Sent]` 已发出但结果未定（`Inflight()` 返回其数量），`Received` 为已交给本端应用的段数；连接关闭后这些计数仍然有效，不会被统一标成成功或取消。
 - `Snapshot()` 返回可保存的值拷贝，按真实 `StreamID`/方法名关联流，并记录发送和已确认序号、`ConfirmedRange()`、`PendingRange()`、每段负载大小、收发半关闭状态、收尾原因以及当时连接共享额度（`Limit`/`Used`/`Available`）。快照只读取诊断事实，不发送帧、不触发重放，也不会把未知结果改成成功；`CompareStreamSnapshots(before, after)` 只计算两次快照之间新增得到 ACK 的连续区间。
+- 收尾原因同时以稳定形式 `ReasonKind` 保存：正常结束为 `eof`、主动取消为 `canceled`、超时为 `timeout`、连接断开为 `connection_closed`（对端重置为 `reset`），连接快照同样记录关闭事实与原因种类。`SaveStreamSnapshots`/`LoadStreamSnapshots` 把快照写成可重读的 JSON；重读后的快照仍按原 `StreamID` 与序号查询（`FindStreamSnapshot`、`SegmentSizes`、确认/待确认区间），但只是纯数据——不能发送、不能重放，待确认区间依旧保持未知，不会变成成功。已保存的旧快照是值拷贝，不随活动连接后续变化。
 - `CloseSend` 半关闭只结束本方向：对端 `Recv` 在消费完已发数据后得到 `io.EOF`，反方向及其他流、普通请求照常继续；半关闭后 `Send` 返回 `ErrStreamClosed`。双向同时半关闭时双方最终状态一致，半关闭尾段在已经报告正常结束后不会再被重置丢失。
 - `Cancel` 只取消目标流：对端 handler 的 context 被取消，本端后续操作为 `context.Canceled`；取消帧不排在受流控的数据帧之后，且绝不扩散到同一连接上的其他流或普通请求。与尾段 ACK 交错时，已经被对端确认的分段仍正常完成。服务端 handler 未读完入方向数据就返回时，框架先发半关闭再发重置，仍开放的对端发送方向得到 `ErrStreamReset`，不会无声悬挂；对端若已经半关闭，则不再误发重置。
 - 连接中断时，流上的 `Send`/`Recv` 返回 `ErrConnectionClosed`；`State()` 如实保留 `Acked`（对端已确认）与 `Sent>Acked`（已发出但结果不能确定）。普通请求断线时同样以 `ErrConnectionClosed` 失败，结果视为不能确定，框架绝不静默重放可能有副作用的请求；只有新调用才会走新会话。

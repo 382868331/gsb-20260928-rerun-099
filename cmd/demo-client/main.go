@@ -130,9 +130,13 @@ func printStreamSnapshot(label string, snap rpc.StreamSnapshot) {
 	if snap.CloseReason != nil {
 		reason = snap.CloseReason.Error()
 	}
-	fmt.Printf("%s stream_id=%d method=%s sent=%d acked=%d confirmed=%s pending=%s sizes=%v done=%t reason=%q shared_credits=%d/%d available=%d closed=%t\n",
-		label, snap.StreamID, snap.Method, snap.Sent, snap.Acked, confirmed, pending, snap.SegmentSizes, snap.Done, reason,
-		snap.Connection.Credits.Used, snap.Connection.Credits.Limit, snap.Connection.Credits.Available, snap.Connection.Closed)
+	kind := string(snap.ReasonKind)
+	if kind == "" {
+		kind = "none"
+	}
+	fmt.Printf("%s stream_id=%d method=%s sent=%d acked=%d confirmed=%s pending=%s sizes=%v done=%t reason=%q reason_kind=%s shared_credits=%d/%d available=%d closed=%t conn_reason_kind=%s\n",
+		label, snap.StreamID, snap.Method, snap.Sent, snap.Acked, confirmed, pending, snap.SegmentSizes, snap.Done, reason, kind,
+		snap.Connection.Credits.Used, snap.Connection.Credits.Limit, snap.Connection.Credits.Available, snap.Connection.Closed, snap.Connection.ReasonKind)
 }
 
 func runStreamPhase(client *rpc.Client) {

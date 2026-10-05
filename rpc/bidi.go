@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 )
@@ -211,6 +212,12 @@ func (s *BidiStream) Send(ctx context.Context, payload []byte, headers map[strin
 				return nil
 			}
 		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				// A send deadline expiring leaves the segment's fate
+				// unknown; record the timeout as the terminal reason so
+				// snapshots distinguish it from cancel and disconnect.
+				s.fail(ctx.Err())
+			}
 			return ctx.Err()
 		case <-s.call.done:
 			return s.terminalErr()
@@ -333,6 +340,7 @@ func (s *BidiStream) Snapshot() StreamSnapshot {
 	for seq, size := range s.sizes {
 		sizes[seq] = size
 	}
+	completed := s.completed
 	snap := StreamSnapshot{
 		StreamID:      s.call.id,
 		Method:        s.call.method,
@@ -352,16 +360,20 @@ func (s *BidiStream) Snapshot() StreamSnapshot {
 	case <-s.call.done:
 		snap.Done = true
 		if snap.CloseReason == nil {
-			snap.CloseReason = ErrConnectionClosed
+			if completed {
+				// Both directions half-closed cleanly: the finish
+				// reason is a normal EOF, not a connection failure.
+				snap.CloseReason = io.EOF
+			} else {
+				snap.CloseReason = ErrConnectionClosed
+			}
 		}
 	default:
 	}
 	if session := s.session; session != nil {
 		snap.Connection = session.diagnosticSnapshot()
-		if snap.Done && snap.Connection.Closed {
-			snap.CloseReason = ErrConnectionClosed
-		}
 	}
+	snap.ReasonKind = ClassifyCloseReason(snap.CloseReason)
 	return snap
 }
 
@@ -703,6 +715,8 @@ func (s *ServerBidiStream) Snapshot() StreamSnapshot {
 		}
 	}
 	snap.Connection.Credits = s.credits.snapshot()
+	snap.ReasonKind = ClassifyCloseReason(snap.CloseReason)
+	snap.Connection.ReasonKind = ClassifyCloseReason(snap.Connection.CloseReason)
 	s.mu.Unlock()
 	return snap
 }
